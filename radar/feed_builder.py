@@ -14,7 +14,7 @@ from .models import RepoItem
 def classify_bucket(sources: List[str]) -> str:
     if any("Trending" in s for s in sources):
         return "trending"
-    if any(s.startswith(("雷达:", "关注开发者:")) for s in sources):
+    if any(s.startswith(("雷达:", "关注开发者:")) or s == "GitHub Releases" for s in sources):
         return "radar"
     return "community"
 
@@ -44,7 +44,15 @@ def write_web_json(
                 "language": item.language or "",
                 "stars": int(item.stars),
                 "forks": int(item.forks),
+                "open_issues": int(item.open_issues),
+                "stars_delta_24h": int(item.stars_delta_24h),
+                "stars_delta_7d": int(item.stars_delta_7d),
+                "topics": list(item.topics),
+                "license_name": item.license_name,
+                "release_tag": item.release_tag,
+                "pushed_at": item.pushed_at,
                 "sources": list(item.sources),
+                "multi_source": len(item.sources) >= 2,
                 "bucket": classify_bucket(item.sources),
                 "discussion_url": item.discussion_url,
                 "discovered_at": item.discovered_at,
@@ -80,15 +88,25 @@ def _build_item_html(item: RepoItem) -> str:
     if item.language:
         meta_bits.append(f"语言: {html.escape(item.language)}")
     if item.stars:
-        meta_bits.append(f"Stars: {item.stars:,}")
+        star_text = f"Stars: {item.stars:,}"
+        if item.stars_delta_24h > 0:
+            star_text += f" (+{item.stars_delta_24h:,} 今日)"
+        meta_bits.append(star_text)
+    if item.license_name:
+        meta_bits.append(f"协议: {html.escape(item.license_name)}")
+    if item.release_tag:
+        meta_bits.append(f"版本: {html.escape(item.release_tag)}")
     if item.sources:
         meta_bits.append("来源: " + html.escape(" + ".join(item.sources)))
     if meta_bits:
         parts.append(f"<p>{' | '.join(meta_bits)}</p>")
 
+    if item.topics:
+        parts.append("<p>标签: " + html.escape(", ".join(item.topics)) + "</p>")
+
     links = [f'<a href="{html.escape(item.url)}">GitHub 仓库</a>']
     if item.discussion_url:
-        links.append(f'<a href="{html.escape(item.discussion_url)}">社区讨论</a>')
+        links.append(f'<a href="{html.escape(item.discussion_url)}">社区讨论 / Release</a>')
     parts.append("<p>" + " · ".join(links) + "</p>")
     return "\n".join(parts)
 
@@ -112,7 +130,8 @@ def write_rss_feed(
         el = ET.SubElement(channel, "item")
         lang_tag = f"[{item.language}] " if item.language else ""
         cat_tag = f"[{item.category_tag}] " if item.category_tag else ""
-        display_title = f"{cat_tag}{lang_tag}{item.repo_name}"
+        delta_tag = f"[+{item.stars_delta_24h}★] " if item.stars_delta_24h > 0 else ""
+        display_title = f"{cat_tag}{lang_tag}{delta_tag}{item.repo_name}"
         if item.ai_highlight:
             display_title += f" — {item.ai_highlight}"
         elif item.desc_cn:

@@ -1,3 +1,10 @@
+network:
+  # 可选：代理地址（如 http://127.0.0.1:7897），也可通过环境变量 RADAR_PROXY 传入
+  proxy: ""
+  # 可选：读取 GitHub Token 的环境变量名（提升 Search/元信息补充限流配额）
+  github_token_env: "GITHUB_TOKEN"
+  # max_enrich: 80
+
 sources:
   github_trending:
     enabled: true
@@ -32,8 +39,20 @@ sources:
     enabled: true
     limit: 25
 
+  huggingface_papers:
+    enabled: true
+    limit: 20
+
+  github_releases:
+    enabled: true
+    repos:
+      - "astral-sh/uv"
+      - "ollama/ollama"
+
   reddit_rss:
     enabled: true
+    # 可替换为自建 RSSHub 前缀，例如 "https://rsshub.example.com/reddit/subreddit"
+    rss_base_url: "https://www.reddit.com"
     subreddits:
       - "opensource"
       - "SideProject"
@@ -47,6 +66,11 @@ filters:
   max_repo_age_years: 5
   anti_star_farm: true
   min_desc_chars: 6
+  min_stars: 0
+  # 白名单仓库（owner/repo），命中后跳过关键词/语言等常规去噪过滤
+  whitelist_repos: []
+  # 屏蔽高频刷榜或营销号作者/组织（owner）
+  blacklist_owners: []
   blacklist_keywords:
     # 1. 资源合集 / 笔记路线图
     - "awesome-"
@@ -137,10 +161,28 @@ translation:
 
 ai_highlight:
   enabled: true
+  # auto: 优先读取 OpenAI 兼容 API Key (RADAR_AI_API_KEY / OPENAI_API_KEY)，否则自动降级检测 agy CLI
+  provider: "auto"
+  base_url: "https://api.openai.com/v1"
+  openai_model: "gpt-4o-mini"
+  api_key_env: "RADAR_AI_API_KEY"
   agy_executable: "agy"
   model: "gemini-4-hydrogen-medium"
   max_batch_items: 25
   timeout_seconds: 90
+
+notifications:
+  enabled: false
+  # 支持 generic / feishu / dingtalk / wecom / discord / telegram
+  provider: "generic"
+  # 建议通过环境变量 RADAR_WEBHOOK_URL 传入，不要将密钥写死在配置里
+  webhook_url: ""
+  only_new: true
+  min_sources: 1
+  min_stars: 0
+  top_n: 10
+  languages: []
+  keywords: []
 
 output:
   max_feed_items: 120

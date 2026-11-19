@@ -42,6 +42,7 @@
     language: "",
     search: "",
     sort: "newest",
+    multiOnly: false,
     hideRead: false,
     saved: new Set(),
     read: new Set(),
@@ -58,6 +59,7 @@
     searchInput: document.getElementById("searchInput"),
     langSelect: document.getElementById("langSelect"),
     sortSelect: document.getElementById("sortSelect"),
+    btnMultiSource: document.getElementById("btnMultiSource"),
     btnHideRead: document.getElementById("btnHideRead"),
     categoryRibbon: document.getElementById("categoryRibbon"),
     filterStatus: document.getElementById("filterStatus"),
@@ -83,6 +85,17 @@
     localStatsSummary: document.getElementById("localStatsSummary"),
     btnClearHidden: document.getElementById("btnClearHidden"),
     btnClearRead: document.getElementById("btnClearRead"),
+    btnExportSavedMd: document.getElementById("btnExportSavedMd"),
+    btnExportBackup: document.getElementById("btnExportBackup"),
+    btnImportBackup: document.getElementById("btnImportBackup"),
+    importBackupInput: document.getElementById("importBackupInput"),
+    btnDigestModal: document.getElementById("btnDigestModal"),
+    digestBackdrop: document.getElementById("digestBackdrop"),
+    btnCloseDigest: document.getElementById("btnCloseDigest"),
+    digestSubtitle: document.getElementById("digestSubtitle"),
+    digestTextarea: document.getElementById("digestTextarea"),
+    btnDownloadDigest: document.getElementById("btnDownloadDigest"),
+    btnCopyDigest: document.getElementById("btnCopyDigest"),
     btnTheme: document.getElementById("btnTheme"),
     themeIconSun: document.getElementById("themeIconSun"),
     themeIconMoon: document.getElementById("themeIconMoon"),
@@ -111,7 +124,6 @@
 
   function formatStars(n) {
     const num = Number(n) || 0;
-    if (num >= 10000) return `${(num / 1000).toFixed(1)}k`;
     if (num >= 1000) return `${(num / 1000).toFixed(1)}k`;
     return String(num);
   }
@@ -123,6 +135,27 @@
     const mm = String(d.getMonth() + 1).padStart(2, "0");
     const dd = String(d.getDate()).padStart(2, "0");
     return `${mm}/${dd}`;
+  }
+
+  function getLocalDateKey(iso) {
+    if (!iso) return "未知日期";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso).slice(0, 10) || "未知日期";
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  function formatDateSectionLabel(dateKey) {
+    if (!dateKey || dateKey === "未知日期") return "早期收录";
+    const now = new Date();
+    const todayKey = getLocalDateKey(now.toISOString());
+    const yest = new Date(now.getTime() - 86400000);
+    const yestKey = getLocalDateKey(yest.toISOString());
+    if (dateKey === todayKey) return `本期 · ${dateKey}（今日）`;
+    if (dateKey === yestKey) return `上期 · ${dateKey}（昨天）`;
+    return `往期 · ${dateKey}`;
   }
 
   function formatFullTime(iso) {
@@ -162,6 +195,18 @@
       showToast("复制失败，请手动复制");
     }
     document.body.removeChild(ta);
+  }
+
+  function downloadTextFile(filename, content, mime = "text/plain;charset=utf-8") {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   function loadLocalPrefs() {
@@ -238,6 +283,10 @@
       list = list.filter((it) => it.language === state.language);
     }
 
+    if (state.multiOnly) {
+      list = list.filter((it) => (it.sources || []).length >= 2);
+    }
+
     if (state.hideRead && state.bucket !== "saved") {
       list = list.filter((it) => !state.read.has(it.key));
     }
@@ -251,6 +300,9 @@
           it.description,
           it.category_tag,
           it.language,
+          it.license_name,
+          it.release_tag,
+          ...(it.topics || []),
           ...(it.sources || []),
         ]
           .join(" ")
@@ -262,10 +314,24 @@
     const sorted = [...list];
     if (state.sort === "stars") {
       sorted.sort((a, b) => (b.stars || 0) - (a.stars || 0));
+    } else if (state.sort === "delta") {
+      sorted.sort((a, b) => {
+        const dd = (b.stars_delta_24h || 0) - (a.stars_delta_24h || 0);
+        if (dd !== 0) return dd;
+        const ms = (b.sources || []).length - (a.sources || []).length;
+        if (ms !== 0) return ms;
+        return (b.stars || 0) - (a.stars || 0);
+      });
     } else {
       sorted.sort((a, b) => {
-        const dt = String(b.discovered_at || "").localeCompare(String(a.discovered_at || ""));
-        if (dt !== 0) return dt;
+        const dA = getLocalDateKey(a.discovered_at);
+        const dB = getLocalDateKey(b.discovered_at);
+        const dayCmp = dB.localeCompare(dA);
+        if (dayCmp !== 0) return dayCmp;
+        const ms = (b.sources || []).length - (a.sources || []).length;
+        if (ms !== 0) return ms;
+        const dd = (b.stars_delta_24h || 0) - (a.stars_delta_24h || 0);
+        if (dd !== 0) return dd;
         return (b.stars || 0) - (a.stars || 0);
       });
     }
@@ -281,16 +347,19 @@
       community: 0,
       saved: 0,
     };
+    let multiCount = 0;
     for (const it of visible) {
       if (it.bucket === "trending") counts.trending += 1;
       else if (it.bucket === "radar") counts.radar += 1;
       else counts.community += 1;
       if (state.saved.has(it.key)) counts.saved += 1;
+      if ((it.sources || []).length >= 2) multiCount += 1;
     }
     for (const [k, v] of Object.entries(counts)) {
       const el = els.bucketTabs.querySelector(`[data-count="${k}"]`);
       if (el) el.textContent = String(v);
     }
+    els.btnMultiSource.textContent = multiCount > 0 ? `多源共振 (${multiCount})` : "多源共振";
   }
 
   function populateLanguages() {
@@ -351,6 +420,7 @@
     if (state.category) activeParts.push(`主题「${state.category}」`);
     if (state.language) activeParts.push(`语言「${state.language}」`);
     if (state.search.trim()) activeParts.push(`关键词「${state.search.trim()}」`);
+    if (state.multiOnly) activeParts.push("仅看多源共振");
     if (state.hideRead && state.bucket !== "saved") activeParts.push("仅看未读");
 
     if (activeParts.length === 0) {
@@ -371,6 +441,87 @@
     if (en && en !== primaryText) return en;
     if (cn && cn !== primaryText) return cn;
     return "";
+  }
+
+  function renderCardHtml(item, isFeatured) {
+    const isRead = state.read.has(item.key);
+    const isSaved = state.saved.has(item.key);
+    const isActiveDrawer = state.drawerKey === item.key;
+    const bMeta = BUCKET_META[item.bucket] || BUCKET_META.community;
+    const langColor = LANG_COLORS[item.language] || "#8B949E";
+    const primaryText = pickCardPrimaryText(item);
+    const secondaryText = pickCardSecondaryText(item, primaryText);
+    const sourceCount = (item.sources || []).length;
+    const delta24 = Number(item.stars_delta_24h || 0);
+
+    const cardClasses = [
+      "repo-card",
+      isFeatured ? "is-featured" : "",
+      isRead ? "is-read" : "",
+      isActiveDrawer ? "is-active-drawer" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    return `
+      <article class="${cardClasses}" data-key="${escapeHtml(item.key)}" tabindex="0">
+        <div class="card-eyebrow">
+          <div class="eyebrow-left">
+            <span class="bucket-pill ${bMeta.cls}">${bMeta.label}</span>
+            ${sourceCount >= 2 ? `<span class="multi-badge" title="同时命中：${escapeHtml(item.sources.join(" + "))}">多源×${sourceCount}</span>` : ""}
+            ${item.release_tag ? `<span class="release-badge">${escapeHtml(item.release_tag)}</span>` : ""}
+            ${item.category_tag ? `<span class="cat-label">${escapeHtml(item.category_tag)}</span>` : ""}
+          </div>
+          <div class="eyebrow-right">
+            ${
+              item.language
+                ? `<span class="lang-badge"><span class="lang-dot" style="background:${langColor}"></span>${escapeHtml(item.language)}</span>`
+                : ""
+            }
+            <span class="star-badge" title="${item.stars.toLocaleString()} Stars">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M12 2.6l2.9 5.88 6.5.94-4.7 4.58 1.1 6.47L12 17.4l-5.8 3.07 1.1-6.47-4.7-4.58 6.5-.94L12 2.6z"/></svg>
+              ${formatStars(item.stars)}
+            </span>
+            ${delta24 > 0 ? `<span class="delta-badge" title="近 24h 新增 ${delta24.toLocaleString()} Stars">+${formatStars(delta24)}</span>` : ""}
+          </div>
+        </div>
+
+        <h2 class="repo-heading">
+          ${item.owner ? `<span class="repo-owner">${escapeHtml(item.owner)} /</span>` : ""}
+          <span class="repo-title-name">${escapeHtml(item.name || item.repo_name)}</span>
+        </h2>
+
+        <div class="card-body">
+          <p class="card-highlight">${escapeHtml(primaryText)}</p>
+          ${secondaryText ? `<p class="card-subdesc">${escapeHtml(secondaryText)}</p>` : ""}
+        </div>
+
+        <div class="card-footer">
+          <div class="card-date" title="发现于 ${escapeHtml(formatFullTime(item.discovered_at))}">
+            <span class="unread-dot" aria-hidden="true"></span>
+            <span>${formatShortDate(item.discovered_at)}</span>
+          </div>
+
+          <div class="card-actions">
+            <button type="button" class="action-btn ${isSaved ? "is-saved" : ""}" data-action="save" data-key="${escapeHtml(item.key)}" title="${isSaved ? "取消收藏" : "收藏"}">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="${isSaved ? "currentColor" : "none"}" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+            </button>
+            <button type="button" class="action-btn" data-action="read" data-key="${escapeHtml(item.key)}" title="${isRead ? "标为未读" : "标为已读"}">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            </button>
+            <button type="button" class="action-btn" data-action="hide" data-key="${escapeHtml(item.key)}" title="不感兴趣（隐藏）">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+            ${
+              item.discussion_url
+                ? `<a class="action-btn link-pill" href="${escapeHtml(item.discussion_url)}" target="_blank" rel="noopener noreferrer" data-action="link" title="打开社区讨论 / Release">讨论</a>`
+                : ""
+            }
+            <a class="action-btn link-pill" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer" data-action="link" title="在新标签页打开 GitHub 仓库">GitHub ↗</a>
+          </div>
+        </div>
+      </article>
+    `;
   }
 
   function renderCards() {
@@ -400,89 +551,38 @@
       !state.category &&
       !state.language &&
       !state.search.trim() &&
+      !state.multiOnly &&
       state.sort === "newest" &&
       filtered.length >= 4;
 
-    const html = filtered
-      .map((item, idx) => {
-        const isFeatured = allowFeatured && idx === 0;
-        const isRead = state.read.has(item.key);
-        const isSaved = state.saved.has(item.key);
-        const isActiveDrawer = state.drawerKey === item.key;
-        const bMeta = BUCKET_META[item.bucket] || BUCKET_META.community;
-        const langColor = LANG_COLORS[item.language] || "#8B949E";
-        const primaryText = pickCardPrimaryText(item);
-        const secondaryText = pickCardSecondaryText(item, primaryText);
-
-        const cardClasses = [
-          "repo-card",
-          isFeatured ? "is-featured" : "",
-          isRead ? "is-read" : "",
-          isActiveDrawer ? "is-active-drawer" : "",
-        ]
-          .filter(Boolean)
-          .join(" ");
-
-        return `
-          <article class="${cardClasses}" data-key="${escapeHtml(item.key)}" tabindex="0">
-            <div class="card-eyebrow">
-              <div class="eyebrow-left">
-                <span class="bucket-pill ${bMeta.cls}">${bMeta.label}</span>
-                ${item.category_tag ? `<span class="cat-label">${escapeHtml(item.category_tag)}</span>` : ""}
-              </div>
-              <div class="eyebrow-right">
-                ${
-                  item.language
-                    ? `<span class="lang-badge"><span class="lang-dot" style="background:${langColor}"></span>${escapeHtml(item.language)}</span>`
-                    : ""
-                }
-                <span class="star-badge" title="${item.stars.toLocaleString()} Stars">
-                  <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M12 2.6l2.9 5.88 6.5.94-4.7 4.58 1.1 6.47L12 17.4l-5.8 3.07 1.1-6.47-4.7-4.58 6.5-.94L12 2.6z"/></svg>
-                  ${formatStars(item.stars)}
-                </span>
-              </div>
-            </div>
-
-            <h2 class="repo-heading">
-              ${item.owner ? `<span class="repo-owner">${escapeHtml(item.owner)} /</span>` : ""}
-              <span class="repo-title-name">${escapeHtml(item.name || item.repo_name)}</span>
-            </h2>
-
-            <div class="card-body">
-              <p class="card-highlight">${escapeHtml(primaryText)}</p>
-              ${secondaryText ? `<p class="card-subdesc">${escapeHtml(secondaryText)}</p>` : ""}
-            </div>
-
-            <div class="card-footer">
-              <div class="card-date" title="发现于 ${escapeHtml(formatFullTime(item.discovered_at))}">
-                <span class="unread-dot" aria-hidden="true"></span>
-                <span>${formatShortDate(item.discovered_at)}</span>
-              </div>
-
-              <div class="card-actions">
-                <button type="button" class="action-btn ${isSaved ? "is-saved" : ""}" data-action="save" data-key="${escapeHtml(item.key)}" title="${isSaved ? "取消收藏" : "收藏"}">
-                  <svg viewBox="0 0 24 24" width="15" height="15" fill="${isSaved ? "currentColor" : "none"}" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
-                </button>
-                <button type="button" class="action-btn" data-action="read" data-key="${escapeHtml(item.key)}" title="${isRead ? "标为未读" : "标为已读"}">
-                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                </button>
-                <button type="button" class="action-btn" data-action="hide" data-key="${escapeHtml(item.key)}" title="不感兴趣（隐藏）">
-                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                </button>
-                ${
-                  item.discussion_url
-                    ? `<a class="action-btn link-pill" href="${escapeHtml(item.discussion_url)}" target="_blank" rel="noopener noreferrer" data-action="link" title="打开社区讨论">讨论</a>`
-                    : ""
-                }
-                <a class="action-btn link-pill" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer" data-action="link" title="在新标签页打开 GitHub 仓库">GitHub ↗</a>
-              </div>
-            </div>
-          </article>
-        `;
-      })
-      .join("");
-
-    els.cardGrid.innerHTML = html;
+    if (state.sort === "newest") {
+      // Group by discovery date for magazine issue timeline feel
+      const groups = new Map();
+      for (const item of filtered) {
+        const dk = getLocalDateKey(item.discovered_at);
+        if (!groups.has(dk)) groups.set(dk, []);
+        groups.get(dk).push(item);
+      }
+      const chunks = [];
+      let globalIdx = 0;
+      for (const [dateKey, groupItems] of groups.entries()) {
+        chunks.push(`
+          <div class="date-section-header">
+            <span class="date-section-title">${escapeHtml(formatDateSectionLabel(dateKey))}</span>
+            <span class="date-section-count">共 ${groupItems.length} 项</span>
+          </div>
+        `);
+        for (const item of groupItems) {
+          chunks.push(renderCardHtml(item, allowFeatured && globalIdx === 0));
+          globalIdx += 1;
+        }
+      }
+      els.cardGrid.innerHTML = chunks.join("");
+    } else {
+      els.cardGrid.innerHTML = filtered
+        .map((item, idx) => renderCardHtml(item, allowFeatured && idx === 0))
+        .join("");
+    }
   }
 
   function getItemByKey(key) {
@@ -530,12 +630,10 @@
     if (!state.read.has(key)) {
       state.read.add(key);
       saveLocalPrefs();
-      // Update card class in place without reflowing/removing the grid while drawer is open
       const cardEl = els.cardGrid.querySelector(`[data-key="${CSS.escape(key)}"]`);
       if (cardEl) cardEl.classList.add("is-read");
     }
 
-    // Highlight active card gently
     els.cardGrid.querySelectorAll(".repo-card.is-active-drawer").forEach((el) => el.classList.remove("is-active-drawer"));
     const activeCard = els.cardGrid.querySelector(`[data-key="${CSS.escape(key)}"]`);
     if (activeCard) activeCard.classList.add("is-active-drawer");
@@ -549,29 +647,44 @@
     const langColor = LANG_COLORS[item.language] || "#8B949E";
     const isSaved = state.saved.has(item.key);
     const cachedReadme = state.readmeCache.get(item.key);
+    const delta24 = Number(item.stars_delta_24h || 0);
+    const delta7d = Number(item.stars_delta_7d || 0);
+    const topics = Array.isArray(item.topics) ? item.topics : [];
 
     els.drawerBody.innerHTML = `
       <div class="drawer-tags">
         <span class="bucket-pill ${bMeta.cls}">${bMeta.label}</span>
+        ${(item.sources || []).length >= 2 ? `<span class="multi-badge">多源共振×${item.sources.length}</span>` : ""}
+        ${item.release_tag ? `<span class="release-badge">${escapeHtml(item.release_tag)}</span>` : ""}
         ${item.category_tag ? `<span class="cat-label">${escapeHtml(item.category_tag)}</span>` : ""}
-        ${(item.sources || [])
-          .map((s) => `<span class="bucket-pill">${escapeHtml(s)}</span>`)
-          .join("")}
+        ${(item.sources || []).map((s) => `<span class="bucket-pill">${escapeHtml(s)}</span>`).join("")}
       </div>
 
       ${item.owner ? `<div class="drawer-owner">${escapeHtml(item.owner)} /</div>` : ""}
       <h2 class="drawer-title">${escapeHtml(item.name || item.repo_name)}</h2>
 
       <div class="drawer-metrics">
-        <span>★ ${item.stars.toLocaleString()} Stars</span>
+        <span>★ ${item.stars.toLocaleString()} Stars${delta24 > 0 ? ` <span class="delta-badge">+${delta24.toLocaleString()} / 24h</span>` : ""}</span>
+        ${delta7d > delta24 ? `<span>7d +${delta7d.toLocaleString()}</span>` : ""}
         <span>⑂ ${item.forks.toLocaleString()} Forks</span>
+        ${item.open_issues > 0 ? `<span>◎ ${item.open_issues.toLocaleString()} Issues</span>` : ""}
         ${
           item.language
             ? `<span class="lang-badge"><span class="lang-dot" style="background:${langColor}"></span>${escapeHtml(item.language)}</span>`
             : ""
         }
+        ${item.license_name ? `<span>⚖ ${escapeHtml(item.license_name)}</span>` : ""}
+        ${item.pushed_at ? `<span>最近提交 ${escapeHtml(formatShortDate(item.pushed_at))}</span>` : ""}
         <span>收录 ${escapeHtml(formatFullTime(item.discovered_at))}</span>
       </div>
+
+      ${
+        topics.length
+          ? `<div class="topic-chips">${topics
+              .map((t) => `<button type="button" class="topic-chip" data-topic="${escapeHtml(t)}" title="按 Topic 搜索">#${escapeHtml(t)}</button>`)
+              .join("")}</div>`
+          : ""
+      }
 
       ${
         item.ai_highlight
@@ -636,11 +749,19 @@
 
     els.drawerBody.scrollTop = 0;
 
-    // Wire drawer actions
     const btnLoadReadme = document.getElementById("btnLoadReadme");
     if (btnLoadReadme && !cachedReadme) {
       btnLoadReadme.addEventListener("click", () => loadReadmePreview(item));
     }
+
+    els.drawerBody.querySelectorAll("[data-topic]").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        state.search = chip.dataset.topic || "";
+        els.searchInput.value = state.search;
+        closeDrawer();
+        showToast(`已按 Topic「${state.search}」筛选`);
+      });
+    });
 
     document.getElementById("btnCopyClone").addEventListener("click", () => {
       copyText(`git clone ${item.url}.git`, "已复制 git clone 命令");
@@ -714,17 +835,13 @@
 
     const inlineFormat = (raw) => {
       let s = escapeHtml(raw);
-      // Inline code
       s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
-      // Images ![alt](url)
       s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, src) => {
         const cleanUrl = resolveGithubAssetUrl(src, repoName);
         if (!cleanUrl) return "";
         return `<img alt="${alt}" src="${escapeHtml(cleanUrl)}" loading="lazy" />`;
       });
-      // Links [text](url)
       s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-      // Bold
       s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
       return s;
     };
@@ -751,7 +868,6 @@
         flushList();
         continue;
       }
-      // Skip raw HTML blocks like badges/tables in READMEs to keep preview clean
       if (/^<\/?[a-zA-Z]/.test(trimmed)) {
         continue;
       }
@@ -821,9 +937,11 @@
     state.category = "";
     state.language = "";
     state.search = "";
+    state.multiOnly = false;
     state.hideRead = false;
     els.searchInput.value = "";
     els.langSelect.value = "";
+    els.btnMultiSource.setAttribute("aria-pressed", "false");
     els.btnHideRead.setAttribute("aria-pressed", "false");
     saveLocalPrefs();
     renderCards();
@@ -831,16 +949,15 @@
 
   /* ---------- RSS & Management Modal ---------- */
   function openRssModal() {
-    const origin = window.location.origin;
     const feeds = [
-      { name: "全源聚合精选", path: "/feeds/all_discoveries.xml" },
-      { name: "GitHub Trending（全语言精选）", path: "/feeds/github_trending.xml" },
-      { name: "GitHub 定向雷达 & 开发者关注", path: "/feeds/github_radar.xml" },
-      { name: "开源社区发现（Show HN / HelloGitHub）", path: "/feeds/community_picks.xml" },
+      { name: "全源聚合精选", rel: "./feeds/all_discoveries.xml" },
+      { name: "GitHub Trending（全语言精选）", rel: "./feeds/github_trending.xml" },
+      { name: "GitHub 定向雷达 & Release 追踪", rel: "./feeds/github_radar.xml" },
+      { name: "开源社区发现（Show HN / HelloGitHub / HuggingFace）", rel: "./feeds/community_picks.xml" },
     ];
     els.rssList.innerHTML = feeds
       .map((f) => {
-        const full = `${origin}${f.path}`;
+        const full = new URL(f.rel, window.location.href).href;
         return `
           <div class="rss-row">
             <div class="rss-row-info">
@@ -859,6 +976,46 @@
 
   function closeRssModal() {
     els.rssBackdrop.hidden = true;
+  }
+
+  /* ---------- Daily Digest Modal ---------- */
+  function buildMarkdownDigest(items, title) {
+    const today = state.status.last_run_date || getLocalDateKey(new Date().toISOString());
+    const lines = [`# ${title} (${today})`, ""];
+    items.forEach((it, idx) => {
+      const tags = [];
+      if ((it.sources || []).length >= 2) tags.push(`多源×${it.sources.length}`);
+      if (it.category_tag) tags.push(it.category_tag);
+      if (it.language) tags.push(it.language);
+      let starPart = `★${(it.stars || 0).toLocaleString()}`;
+      if ((it.stars_delta_24h || 0) > 0) starPart += ` (+${it.stars_delta_24h.toLocaleString()})`;
+      tags.push(starPart);
+      const summary = it.ai_highlight || it.desc_cn || it.description || "";
+      lines.push(`${idx + 1}. **[${it.repo_name}](${it.url})** · ${tags.join(" · ")}`);
+      if (summary) lines.push(`   > ${summary}`);
+    });
+    return lines.join("\n");
+  }
+
+  function openDigestModal() {
+    const filtered = getFilteredItems();
+    const topItems = [...filtered]
+      .sort((a, b) => {
+        const ms = (b.sources || []).length - (a.sources || []).length;
+        if (ms !== 0) return ms;
+        const dd = (b.stars_delta_24h || 0) - (a.stars_delta_24h || 0);
+        if (dd !== 0) return dd;
+        return (b.stars || 0) - (a.stars || 0);
+      })
+      .slice(0, 12);
+
+    els.digestSubtitle.textContent = `已按多源共振、24h 增速与当前筛选整理前 ${topItems.length} 项（共匹配 ${filtered.length} 项），可直接复制或下载：`;
+    els.digestTextarea.value = buildMarkdownDigest(topItems, "GitHub Radar 每日开源精选");
+    els.digestBackdrop.hidden = false;
+  }
+
+  function closeDigestModal() {
+    els.digestBackdrop.hidden = true;
   }
 
   /* ---------- Event Wiring ---------- */
@@ -901,6 +1058,12 @@
       renderCards();
     });
 
+    els.btnMultiSource.addEventListener("click", () => {
+      state.multiOnly = !state.multiOnly;
+      els.btnMultiSource.setAttribute("aria-pressed", String(state.multiOnly));
+      renderCards();
+    });
+
     els.btnHideRead.addEventListener("click", () => {
       state.hideRead = !state.hideRead;
       els.btnHideRead.setAttribute("aria-pressed", String(state.hideRead));
@@ -930,7 +1093,7 @@
             saveLocalPrefs();
             card.classList.add("is-read");
           }
-          return; // allow normal external link navigation
+          return;
         }
         e.stopPropagation();
         const key = actionEl.dataset.key;
@@ -997,13 +1160,82 @@
       showToast("已清空全部已读标记");
     });
 
-    // Global keyboard shortcuts
+    els.btnExportSavedMd.addEventListener("click", () => {
+      const savedItems = state.items.filter((it) => state.saved.has(it.key));
+      if (!savedItems.length) {
+        showToast("当前还没有收藏任何项目");
+        return;
+      }
+      const md = buildMarkdownDigest(savedItems, "GitHub Radar 我的开源收藏");
+      downloadTextFile(`github-radar-saved-${getLocalDateKey(new Date().toISOString())}.md`, md, "text/markdown;charset=utf-8");
+      showToast(`已导出 ${savedItems.length} 个收藏项目为 Markdown`);
+    });
+
+    els.btnExportBackup.addEventListener("click", () => {
+      const payload = {
+        exported_at: new Date().toISOString(),
+        saved: [...state.saved],
+        read: [...state.read],
+        hidden: [...state.hidden],
+        hideRead: state.hideRead,
+        theme: state.theme,
+      };
+      downloadTextFile(
+        `github-radar-backup-${getLocalDateKey(new Date().toISOString())}.json`,
+        JSON.stringify(payload, null, 2),
+        "application/json;charset=utf-8"
+      );
+      showToast("已导出本地阅读记录备份");
+    });
+
+    els.btnImportBackup.addEventListener("click", () => {
+      els.importBackupInput.click();
+    });
+
+    els.importBackupInput.addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        if (Array.isArray(parsed.saved)) state.saved = new Set(parsed.saved);
+        if (Array.isArray(parsed.read)) state.read = new Set(parsed.read);
+        if (Array.isArray(parsed.hidden)) state.hidden = new Set(parsed.hidden);
+        if (typeof parsed.hideRead === "boolean") state.hideRead = parsed.hideRead;
+        if (parsed.theme === "dark" || parsed.theme === "light") state.theme = parsed.theme;
+        applyTheme();
+        saveLocalPrefs();
+        populateLanguages();
+        renderCards();
+        els.localStatsSummary.textContent = `已收藏 ${state.saved.size} · 已读 ${state.read.size} · 已屏蔽 ${state.hidden.size}`;
+        showToast("已恢复本地备份记录");
+      } catch {
+        showToast("备份文件格式无效，导入失败");
+      } finally {
+        els.importBackupInput.value = "";
+      }
+    });
+
+    els.btnDigestModal.addEventListener("click", openDigestModal);
+    els.btnCloseDigest.addEventListener("click", closeDigestModal);
+    els.digestBackdrop.addEventListener("click", (e) => {
+      if (e.target === els.digestBackdrop) closeDigestModal();
+    });
+    els.btnCopyDigest.addEventListener("click", () => {
+      copyText(els.digestTextarea.value, "已复制今日精选 Markdown 简报");
+    });
+    els.btnDownloadDigest.addEventListener("click", () => {
+      const day = state.status.last_run_date || getLocalDateKey(new Date().toISOString());
+      downloadTextFile(`github-radar-digest-${day}.md`, els.digestTextarea.value, "text/markdown;charset=utf-8");
+      showToast("已下载简报 Markdown 文件");
+    });
+
     document.addEventListener("keydown", (e) => {
       const tag = (e.target && e.target.tagName) || "";
       const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
 
       if (e.key === "Escape") {
-        if (!els.rssBackdrop.hidden) closeRssModal();
+        if (!els.digestBackdrop.hidden) closeDigestModal();
+        else if (!els.rssBackdrop.hidden) closeRssModal();
         else if (state.drawerKey) closeDrawer();
         else if (document.activeElement === els.searchInput) els.searchInput.blur();
         return;

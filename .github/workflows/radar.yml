@@ -1,0 +1,71 @@
+name: GitHub Radar Daily Build & Pages
+
+on:
+  schedule:
+    # 每天北京时间 03:30 (UTC 19:30) 自动执行
+    - cron: "30 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore SQLite database cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: radar-db-${{ github.run_id }}
+          restore-keys: |
+            radar-db-
+
+      - name: Run GitHub Radar pipeline
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RADAR_AI_API_KEY: ${{ secrets.RADAR_AI_API_KEY }}
+          RADAR_AI_BASE_URL: ${{ secrets.RADAR_AI_BASE_URL }}
+          RADAR_AI_MODEL: ${{ secrets.RADAR_AI_MODEL }}
+          RADAR_WEBHOOK_URL: ${{ secrets.RADAR_WEBHOOK_URL }}
+          RADAR_TG_BOT_TOKEN: ${{ secrets.RADAR_TG_BOT_TOKEN }}
+          RADAR_TG_CHAT_ID: ${{ secrets.RADAR_TG_CHAT_ID }}
+        run: python run.py
+
+      - name: Assemble static site for GitHub Pages
+        run: |
+          mkdir -p _site/feeds
+          cp -r web/* _site/
+          cp -r feeds/* _site/feeds/
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

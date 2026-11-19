@@ -38,6 +38,8 @@ def main() -> None:
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     parser.add_argument("--no-ai", action="store_true", help="Disable batched AI highlights")
     parser.add_argument("--export-only", action="store_true", help="Rebuild feeds and web JSON from existing SQLite DB only")
+    parser.add_argument("--no-notify", action="store_true", help="Disable webhook notifications")
+    parser.add_argument("--notify-dry-run", action="store_true", help="Print notification digest without sending")
     parser.add_argument("--freshrss-user", default="admin", help="FreshRSS username to refresh if container is running")
     args = parser.parse_args()
 
@@ -48,7 +50,13 @@ def main() -> None:
         logger.info("仅导出完成: %s", json.dumps(stats, ensure_ascii=False))
         return
 
-    stats = run_pipeline(cfg, base_dir, enable_ai=not args.no_ai)
+    stats = run_pipeline(
+        cfg,
+        base_dir,
+        enable_ai=not args.no_ai,
+        enable_notify=not args.no_notify,
+        notify_dry_run=args.notify_dry_run,
+    )
     logger.info("执行完成: %s", json.dumps(stats, ensure_ascii=False))
     refresh_freshrss(user=args.freshrss_user)
 

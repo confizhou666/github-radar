@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>GitHub Radar · 每日开源精选画刊</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23171A16'/%3E%3Ccircle cx='32' cy='32' r='19' fill='none' stroke='%23E66A43' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='6' fill='%23E66A43'/%3E%3Cline x1='32' y1='32' x2='48' y2='18' stroke='%23FAFBF8' stroke-width='3.5' stroke-linecap='round'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="./styles.css?v=2" />
+  <link rel="stylesheet" href="./styles.css?v=3" />
 </head>
 <body>
   <div class="page-shell">
@@ -16,11 +16,15 @@
           <span class="brand-mark" aria-hidden="true"></span>
           <h1 class="brand-title">GITHUB RADAR</h1>
         </div>
-        <p class="brand-sub">每日开源精选画刊 · 全源去噪与一句话导读</p>
+        <p class="brand-sub">每日开源精选画刊 · 全源去噪、增速追踪与一句话导读</p>
       </div>
       <div class="masthead-right">
         <div class="issue-meta" id="issueMeta">正在加载本期数据…</div>
         <div class="masthead-actions">
+          <button class="icon-pill" id="btnDigestModal" type="button" title="生成并复制今日精选 Markdown 简报">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+            <span>今日简报</span>
+          </button>
           <button class="icon-pill" id="btnRssModal" type="button" title="RSS 订阅与阅读数据管理">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5" fill="currentColor" stroke="none"/></svg>
             <span>RSS & 管理</span>
@@ -57,7 +61,7 @@
         <div class="filter-controls">
           <label class="search-box">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-            <input id="searchInput" type="search" placeholder="搜索项目或关键词…" autocomplete="off" />
+            <input id="searchInput" type="search" placeholder="搜索项目、Topic 或关键词…" autocomplete="off" />
             <kbd class="kbd-hint">/</kbd>
           </label>
 
@@ -67,8 +71,13 @@
 
           <select id="sortSelect" class="select-ctrl" aria-label="排序方式">
             <option value="newest">最新发现</option>
+            <option value="delta">24h 增速最快</option>
             <option value="stars">Star 最多</option>
           </select>
+
+          <button id="btnMultiSource" class="toggle-ctrl" type="button" aria-pressed="false" title="仅显示同时命中 2 个及以上来源的高可信项目">
+            多源共振
+          </button>
 
           <button id="btnHideRead" class="toggle-ctrl" type="button" aria-pressed="false" title="隐藏已经看过的项目">
             隐藏已读
@@ -96,9 +105,9 @@
     </main>
 
     <footer class="page-footer">
-      <span>每日 03:30 自动采集去噪与导读</span>
+      <span>每日自动采集去噪、增速追踪与 AI 导读</span>
       <span class="footer-dot">·</span>
-      <span>点击卡片任意位置滑出详情抽屉 · 快捷键 <kbd>/</kbd> 搜索 <kbd>←</kbd><kbd>→</kbd> 翻篇 <kbd>D</kbd> 换肤</span>
+      <span>点击卡片滑出详情抽屉 · 快捷键 <kbd>/</kbd> 搜索 <kbd>←</kbd><kbd>→</kbd> 翻篇 <kbd>S</kbd> 收藏 <kbd>D</kbd> 换肤</span>
     </footer>
   </div>
 
@@ -114,20 +123,15 @@
       <button type="button" class="drawer-close" id="btnCloseDrawer" title="关闭 (Esc)" aria-label="关闭详情">✕</button>
     </div>
 
-    <div class="drawer-body" id="drawerBody">
-      <!-- Populated dynamically -->
-    </div>
-
-    <div class="drawer-footer" id="drawerFooter">
-      <!-- Populated dynamically -->
-    </div>
+    <div class="drawer-body" id="drawerBody"></div>
+    <div class="drawer-footer" id="drawerFooter"></div>
   </aside>
 
   <!-- RSS & Local State Modal -->
   <div class="modal-backdrop" id="rssBackdrop" hidden>
     <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="rssModalTitle">
       <div class="modal-head">
-        <h2 id="rssModalTitle">RSS 订阅地址与本地偏好</h2>
+        <h2 id="rssModalTitle">RSS 订阅与本地数据管理</h2>
         <button type="button" class="drawer-close" id="btnCloseRss" aria-label="关闭">✕</button>
       </div>
       <div class="modal-body">
@@ -145,6 +149,38 @@
             <button type="button" class="btn-outline small" id="btnClearRead">清空已读</button>
           </div>
         </div>
+
+        <hr class="modal-divider" />
+        <div class="local-stats-row">
+          <div>
+            <div class="local-stats-title">收藏与配置备份</div>
+            <div class="local-stats-sub">跨设备迁移或导出阅读笔记</div>
+          </div>
+          <div class="local-stats-btns">
+            <button type="button" class="btn-outline small" id="btnExportSavedMd">导出收藏 MD</button>
+            <button type="button" class="btn-outline small" id="btnExportBackup">导出 JSON</button>
+            <button type="button" class="btn-outline small" id="btnImportBackup">导入恢复</button>
+            <input type="file" id="importBackupInput" accept="application/json,.json" hidden />
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Daily Digest Modal -->
+  <div class="modal-backdrop" id="digestBackdrop" hidden>
+    <div class="modal-panel modal-panel-wide" role="dialog" aria-modal="true" aria-labelledby="digestModalTitle">
+      <div class="modal-head">
+        <h2 id="digestModalTitle">今日精选 Markdown 简报</h2>
+        <button type="button" class="drawer-close" id="btnCloseDigest" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note" id="digestSubtitle">已按多源共振、24h 增速与当前筛选优先整理前 12 项，可直接复制发往笔记或群聊：</p>
+        <textarea class="digest-textarea" id="digestTextarea" readonly spellcheck="false"></textarea>
+        <div class="digest-actions">
+          <button type="button" class="btn-outline small" id="btnDownloadDigest">下载 .md 文件</button>
+          <button type="button" class="btn-primary small" id="btnCopyDigest">复制 Markdown 简报</button>
+        </div>
       </div>
     </div>
   </div>
@@ -152,6 +188,6 @@
   <!-- Toast -->
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
-  <script src="./app.js?v=2" defer></script>
+  <script src="./app.js?v=3" defer></script>
 </body>
 </html>

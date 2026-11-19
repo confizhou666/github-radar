@@ -1,24 +1,30 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
 import sqlite3
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import RadarConfig
 from .feed_builder import classify_bucket, write_rss_feed, write_web_json
 from .filters import deduplicate_and_filter
 from .models import RepoItem
-from .sources import collect_all_sources, enrich_github_metadata
+from .notifier import send_notifications
+from .sources import (
+    collect_all_sources,
+    enrich_github_metadata,
+    resolve_github_token,
+    resolve_proxy,
+)
 from .translator import generate_ai_highlights, translate_free_zh
 
 logger = logging.getLogger(__name__)
 
 
 class RadarStore:
-    """SQLite persistence for deduplicated seen repositories and translation cache."""
+    """SQLite persistence for deduplicated repositories, translation cache, and star snapshots."""
 
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,36 +43,125 @@ class RadarStore:
                 language TEXT,
                 stars INTEGER NOT NULL DEFAULT 0,
                 forks INTEGER NOT NULL DEFAULT 0,
+                open_issues INTEGER NOT NULL DEFAULT 0,
+                pushed_at TEXT NOT NULL DEFAULT '',
                 sources_json TEXT NOT NULL DEFAULT '[]',
                 discussion_url TEXT NOT NULL DEFAULT '',
                 desc_cn TEXT NOT NULL DEFAULT '',
                 ai_highlight TEXT NOT NULL DEFAULT '',
                 category_tag TEXT NOT NULL DEFAULT '',
+                stars_delta_24h INTEGER NOT NULL DEFAULT 0,
+                stars_delta_7d INTEGER NOT NULL DEFAULT 0,
+                topics_json TEXT NOT NULL DEFAULT '[]',
+                license_name TEXT NOT NULL DEFAULT '',
+                release_tag TEXT NOT NULL DEFAULT '',
                 kept INTEGER NOT NULL DEFAULT 1,
                 discovered_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS repo_snapshots (
+                canonical_key TEXT NOT NULL,
+                snap_date TEXT NOT NULL,
+                stars INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (canonical_key, snap_date)
+            );
             """
         )
+        # Safely migrate legacy databases created before v2 columns existed
+        existing_cols = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(repos)").fetchall()
+        }
+        migrations = [
+            ("open_issues", "INTEGER NOT NULL DEFAULT 0"),
+            ("pushed_at", "TEXT NOT NULL DEFAULT ''"),
+            ("stars_delta_24h", "INTEGER NOT NULL DEFAULT 0"),
+            ("stars_delta_7d", "INTEGER NOT NULL DEFAULT 0"),
+            ("topics_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("license_name", "TEXT NOT NULL DEFAULT ''"),
+            ("release_tag", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        for col, ddl in migrations:
+            if col not in existing_cols:
+                self.conn.execute(f"ALTER TABLE repos ADD COLUMN {col} {ddl}")
         self.conn.commit()
 
     def get_existing_keys(self) -> set[str]:
         rows = self.conn.execute("SELECT canonical_key FROM repos").fetchall()
         return {str(r["canonical_key"]) for r in rows}
 
+    def compute_deltas(
+        self, canonical_key: str, snap_date: str, current_stars: int
+    ) -> Tuple[int, int]:
+        """Compute (delta_24h, delta_7d) against historical snapshots prior to snap_date."""
+        try:
+            today_dt = datetime.strptime(snap_date, "%Y-%m-%d").date()
+        except ValueError:
+            return 0, 0
+        cutoff_7d = (today_dt - timedelta(days=7)).isoformat()
+        cutoff_24h = (today_dt - timedelta(days=2)).isoformat()
+
+        rows = self.conn.execute(
+            """
+            SELECT snap_date, stars FROM repo_snapshots
+            WHERE canonical_key = ? AND snap_date < ? AND snap_date >= ?
+            ORDER BY snap_date ASC
+            """,
+            (canonical_key, snap_date, cutoff_7d),
+        ).fetchall()
+        if not rows:
+            return 0, 0
+
+        delta_7d = max(0, int(current_stars) - int(rows[0]["stars"]))
+        prev_recent = [r for r in rows if str(r["snap_date"]) >= cutoff_24h]
+        delta_24h = (
+            max(0, int(current_stars) - int(prev_recent[-1]["stars"])) if prev_recent else 0
+        )
+        return delta_24h, max(delta_24h, delta_7d)
+
+    def record_snapshot(self, canonical_key: str, snap_date: str, stars: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO repo_snapshots (canonical_key, snap_date, stars)
+            VALUES (?, ?, ?)
+            ON CONFLICT(canonical_key, snap_date) DO UPDATE SET
+                stars = MAX(repo_snapshots.stars, excluded.stars)
+            """,
+            (canonical_key, snap_date, int(stars)),
+        )
+        self.conn.commit()
+
     def upsert_repo(self, item: RepoItem, *, kept: bool) -> None:
         self.conn.execute(
             """
             INSERT INTO repos (
                 canonical_key, repo_name, url, description, language, stars, forks,
-                sources_json, discussion_url, desc_cn, ai_highlight, category_tag, kept, discovered_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                open_issues, pushed_at, sources_json, discussion_url,
+                desc_cn, ai_highlight, category_tag,
+                stars_delta_24h, stars_delta_7d, topics_json, license_name, release_tag,
+                kept, discovered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(canonical_key) DO UPDATE SET
+                description = CASE
+                    WHEN excluded.description != '' AND (
+                        repos.description = '' OR repos.description LIKE 'Sponsor Star %'
+                    ) THEN excluded.description
+                    ELSE repos.description
+                END,
+                language = COALESCE(repos.language, excluded.language),
                 stars = MAX(repos.stars, excluded.stars),
                 forks = MAX(repos.forks, excluded.forks),
+                open_issues = MAX(repos.open_issues, excluded.open_issues),
+                pushed_at = CASE WHEN excluded.pushed_at != '' THEN excluded.pushed_at ELSE repos.pushed_at END,
                 sources_json = excluded.sources_json,
+                discussion_url = CASE WHEN excluded.discussion_url != '' THEN excluded.discussion_url ELSE repos.discussion_url END,
                 desc_cn = CASE WHEN excluded.desc_cn != '' THEN excluded.desc_cn ELSE repos.desc_cn END,
                 ai_highlight = CASE WHEN excluded.ai_highlight != '' THEN excluded.ai_highlight ELSE repos.ai_highlight END,
-                category_tag = CASE WHEN excluded.category_tag != '' THEN excluded.category_tag ELSE repos.category_tag END
+                category_tag = CASE WHEN excluded.category_tag != '' THEN excluded.category_tag ELSE repos.category_tag END,
+                stars_delta_24h = CASE WHEN excluded.stars_delta_24h > 0 THEN excluded.stars_delta_24h ELSE repos.stars_delta_24h END,
+                stars_delta_7d = CASE WHEN excluded.stars_delta_7d > 0 THEN excluded.stars_delta_7d ELSE repos.stars_delta_7d END,
+                topics_json = CASE WHEN excluded.topics_json != '[]' THEN excluded.topics_json ELSE repos.topics_json END,
+                license_name = CASE WHEN excluded.license_name != '' THEN excluded.license_name ELSE repos.license_name END,
+                release_tag = CASE WHEN excluded.release_tag != '' THEN excluded.release_tag ELSE repos.release_tag END
             """,
             (
                 item.canonical_key,
@@ -76,11 +171,18 @@ class RadarStore:
                 item.language,
                 int(item.stars),
                 int(item.forks),
+                int(item.open_issues),
+                item.pushed_at,
                 json.dumps(item.sources, ensure_ascii=False),
                 item.discussion_url,
                 item.desc_cn,
                 item.ai_highlight,
                 item.category_tag,
+                int(item.stars_delta_24h),
+                int(item.stars_delta_7d),
+                json.dumps(item.topics, ensure_ascii=False),
+                item.license_name,
+                item.release_tag,
                 1 if kept else 0,
                 item.discovered_at,
             ),
@@ -89,7 +191,7 @@ class RadarStore:
 
     def load_recent_kept(self, limit: int = 120) -> List[RepoItem]:
         rows = self.conn.execute(
-            "SELECT * FROM repos WHERE kept = 1 ORDER BY discovered_at DESC, stars DESC LIMIT ?",
+            "SELECT * FROM repos WHERE kept = 1 ORDER BY discovered_at DESC, stars_delta_24h DESC, stars DESC LIMIT ?",
             (int(limit),),
         ).fetchall()
         out: List[RepoItem] = []
@@ -102,12 +204,19 @@ class RadarStore:
                     language=r["language"],
                     stars=int(r["stars"]),
                     forks=int(r["forks"]),
+                    open_issues=int(r["open_issues"] or 0),
+                    pushed_at=str(r["pushed_at"] or ""),
                     sources=json.loads(r["sources_json"] or "[]"),
                     discussion_url=r["discussion_url"],
                     desc_cn=r["desc_cn"],
                     ai_highlight=r["ai_highlight"],
                     category_tag=r["category_tag"],
                     discovered_at=r["discovered_at"],
+                    stars_delta_24h=int(r["stars_delta_24h"] or 0),
+                    stars_delta_7d=int(r["stars_delta_7d"] or 0),
+                    topics=json.loads(r["topics_json"] or "[]"),
+                    license_name=str(r["license_name"] or ""),
+                    release_tag=str(r["release_tag"] or ""),
                 )
             )
         return out
@@ -125,28 +234,49 @@ def run_pipeline(
     ai_runner: Optional[Callable[[str], str]] = None,
     enable_ai: bool = True,
     skip_enrich: bool = False,
+    enable_notify: bool = True,
+    notify_dry_run: bool = False,
 ) -> Dict[str, Any]:
     data_dir = base_dir / "data"
     feeds_dir = base_dir / "feeds"
     data_dir.mkdir(parents=True, exist_ok=True)
     feeds_dir.mkdir(parents=True, exist_ok=True)
 
+    proxy = resolve_proxy(cfg.network)
+    github_token = resolve_github_token(cfg.network)
+
     store = RadarStore(data_dir / "radar.db")
     try:
         raw_items = (
             raw_items_override
             if raw_items_override is not None
-            else collect_all_sources(cfg.sources)
+            else collect_all_sources(cfg.sources, cfg.network)
         )
         if raw_items_override is None and not skip_enrich:
-            enrich_github_metadata(raw_items, max_enrich=20)
+            max_enrich = cfg.network.get("max_enrich")
+            enrich_github_metadata(
+                raw_items,
+                max_enrich=int(max_enrich) if max_enrich is not None else None,
+                proxy=proxy,
+                github_token=github_token,
+            )
 
         kept_candidates, filter_stats = deduplicate_and_filter(raw_items, cfg.filters)
         existing_keys = store.get_existing_keys()
         fresh_items = [r for r in kept_candidates if r.canonical_key not in existing_keys]
         existing_updates = [r for r in kept_candidates if r.canonical_key in existing_keys]
 
-        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat(timespec="seconds")
+        snap_date = now_utc.strftime("%Y-%m-%d")
+
+        # Compute star deltas against previous snapshots before writing today's snapshot
+        for item in kept_candidates:
+            d24, d7 = store.compute_deltas(item.canonical_key, snap_date, item.stars)
+            item.stars_delta_24h = max(item.stars_delta_24h, d24)
+            item.stars_delta_7d = max(item.stars_delta_24h, d7)
+            store.record_snapshot(item.canonical_key, snap_date, item.stars)
+
         # Translate descriptions only for fresh items
         if cfg.translation.get("enabled", True):
             for item in fresh_items:
@@ -162,7 +292,7 @@ def run_pipeline(
         if enable_ai and cfg.ai_highlight.get("enabled", True) and fresh_items:
             ai_results = generate_ai_highlights(fresh_items, cfg.ai_highlight, runner=ai_runner)
 
-        kept_new_count = 0
+        kept_new_items: List[RepoItem] = []
         ai_dropped_count = 0
         for item in fresh_items:
             ai_info = ai_results.get(item.canonical_key)
@@ -174,9 +304,9 @@ def run_pipeline(
                 item.ai_highlight = ai_info.get("highlight", "")
                 item.category_tag = ai_info.get("category_tag", "")
             store.upsert_repo(item, kept=True)
-            kept_new_count += 1
+            kept_new_items.append(item)
 
-        # Update star/source merges for previously seen items without re-translating
+        # Update star/source/metadata merges for previously seen items without re-translating
         for item in existing_updates:
             item.discovered_at = now_iso
             store.upsert_repo(item, kept=True)
@@ -188,7 +318,7 @@ def run_pipeline(
             "raw_count": filter_stats["raw_count"],
             "unique_count": filter_stats["unique_count"],
             "dropped_count": filter_stats["dropped_count"] + ai_dropped_count,
-            "new_count": kept_new_count,
+            "new_count": len(kept_new_items),
             "feed_total": 0,
         }
         feed_total = _write_all_outputs(store, cfg, feeds_dir, status_payload, max_feed=max_feed)
@@ -197,6 +327,14 @@ def run_pipeline(
             json.dumps(status_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+        if enable_notify and (cfg.notifications.get("enabled", False) or notify_dry_run):
+            only_new = bool(cfg.notifications.get("only_new", True))
+            notify_pool = kept_new_items if only_new else store.load_recent_kept(limit=max_feed)
+            if not notify_pool and notify_dry_run:
+                notify_pool = store.load_recent_kept(limit=max_feed)
+            send_notifications(notify_pool, status_payload, cfg.notifications, dry_run=notify_dry_run)
+
         return status_payload
     finally:
         store.close()
@@ -244,13 +382,13 @@ def _write_all_outputs(
     )
     write_rss_feed(
         title="GitHub 定向雷达 & 开发者关注",
-        description="低星黑马 / 创作者动态精选",
+        description="低星黑马 / 创作者动态 / Release 追踪精选",
         link=f"{base_url}/github_radar.xml",
         items=radar_items,
         out_path=feeds_dir / "github_radar.xml",
     )
     write_rss_feed(
-        title="开源社区发现（Show HN / HelloGitHub / Reddit）",
+        title="开源社区发现（Show HN / HelloGitHub / HuggingFace / Reddit）",
         description="跨社区精选开源项目",
         link=f"{base_url}/community_picks.xml",
         items=community_items,

@@ -22,6 +22,11 @@ class RepoItem:
     ai_highlight: str = ""
     category_tag: str = ""
     discovered_at: str = ""
+    stars_delta_24h: int = 0
+    stars_delta_7d: int = 0
+    topics: List[str] = field(default_factory=list)
+    license_name: str = ""
+    release_tag: str = ""
 
     @property
     def canonical_key(self) -> str:

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import html
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
@@ -27,12 +28,41 @@ TRENDING_ARTICLE_RE = re.compile(
 )
 
 
-def _http_get(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: int = 12) -> Tuple[int, str, Dict[str, str]]:
+def resolve_github_token(network_cfg: Optional[Dict[str, Any]] = None) -> str:
+    cfg = network_cfg or {}
+    env_name = str(cfg.get("github_token_env") or "GITHUB_TOKEN").strip()
+    return str(cfg.get("github_token") or os.environ.get(env_name, "") or "").strip()
+
+
+def resolve_proxy(network_cfg: Optional[Dict[str, Any]] = None) -> str:
+    cfg = network_cfg or {}
+    return str(cfg.get("proxy") or os.environ.get("RADAR_PROXY", "") or "").strip()
+
+
+def _http_get(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 12,
+    proxy: str = "",
+    github_token: str = "",
+) -> Tuple[int, str, Dict[str, str]]:
     req_headers = {"User-Agent": UA}
     if headers:
         req_headers.update(headers)
+    if github_token and "api.github.com" in url and "Authorization" not in req_headers:
+        req_headers["Authorization"] = f"Bearer {github_token}"
+
     req = urllib.request.Request(url, headers=req_headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+        ctx = opener.open(req, timeout=timeout)
+    else:
+        ctx = urllib.request.urlopen(req, timeout=timeout)
+
+    with ctx as resp:
         raw = resp.read().decode("utf-8", errors="replace")
         resp_hdrs = {k.lower(): v for k, v in resp.headers.items()}
         return int(resp.status), raw, resp_hdrs
@@ -56,7 +86,12 @@ def _parse_int_loose(text: str) -> int:
         return 0
 
 
-def parse_github_trending_html(html_text: str, *, source_label: str = "GitHub Trending") -> List[RepoItem]:
+def parse_github_trending_html(
+    html_text: str,
+    *,
+    source_label: str = "GitHub Trending",
+    since: str = "daily",
+) -> List[RepoItem]:
     items: List[RepoItem] = []
     for match in TRENDING_ARTICLE_RE.finditer(html_text or ""):
         block = match.group(1)
@@ -68,8 +103,17 @@ def parse_github_trending_html(html_text: str, *, source_label: str = "GitHub Tr
         if not m_href:
             continue
         repo_name = m_href.group(1).strip("/")
-        m_desc = re.search(r"<p[^>]*>(.*?)</p>", block, re.DOTALL | re.IGNORECASE)
+
+        # Match <p ...> strictly with word boundary so <path ...> SVGs never match <p[^>]*>.
+        m_desc = re.search(
+            r"<p\b[^>]*class=\"[^\"]*col-9[^\"]*\"[^>]*>(.*?)</p>",
+            block,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not m_desc:
+            m_desc = re.search(r"<p\b[^>]*>(.*?)</p>", block, re.DOTALL | re.IGNORECASE)
         desc = _clean_html_text(m_desc.group(1)) if m_desc else ""
+
         m_lang = re.search(
             r'itemprop="programmingLanguage"[^>]*>(.*?)</span>',
             block,
@@ -89,6 +133,15 @@ def parse_github_trending_html(html_text: str, *, source_label: str = "GitHub Tr
         )
         forks = _parse_int_loose(_clean_html_text(m_forks.group(1))) if m_forks else 0
 
+        delta_24h = 0
+        m_today = re.search(r"([\d,]+)\s+stars\s+today", block, re.IGNORECASE)
+        if m_today:
+            delta_24h = _parse_int_loose(m_today.group(1))
+        elif since == "daily":
+            m_period = re.search(r"([\d,]+)\s+stars\s+this", block, re.IGNORECASE)
+            if m_period:
+                delta_24h = _parse_int_loose(m_period.group(1))
+
         items.append(
             RepoItem(
                 repo_name=repo_name,
@@ -98,6 +151,7 @@ def parse_github_trending_html(html_text: str, *, source_label: str = "GitHub Tr
                 stars=stars,
                 forks=forks,
                 sources=[source_label],
+                stars_delta_24h=delta_24h,
             )
         )
     return items
@@ -124,6 +178,14 @@ def _repo_from_gh_api(raw: Dict[str, Any], source_label: str) -> Optional[RepoIt
     full_name = str(raw.get("full_name") or "").strip()
     if not full_name or "/" not in full_name:
         return None
+    lic = raw.get("license")
+    license_name = ""
+    if isinstance(lic, dict):
+        spdx = str(lic.get("spdx_id") or "").strip()
+        if spdx and spdx.upper() != "NOASSERTION":
+            license_name = spdx
+    topics_raw = raw.get("topics") or []
+    topics = [str(t).strip() for t in topics_raw if str(t).strip()][:6]
     return RepoItem(
         repo_name=full_name,
         url=str(raw.get("html_url") or f"https://github.com/{full_name}"),
@@ -135,10 +197,12 @@ def _repo_from_gh_api(raw: Dict[str, Any], source_label: str) -> Optional[RepoIt
         created_at=str(raw.get("created_at") or ""),
         pushed_at=str(raw.get("pushed_at") or ""),
         sources=[source_label],
+        topics=topics,
+        license_name=license_name,
     )
 
 
-def fetch_github_trending(cfg: Dict[str, Any]) -> List[RepoItem]:
+def fetch_github_trending(cfg: Dict[str, Any], *, proxy: str = "") -> List[RepoItem]:
     if not cfg.get("enabled", True):
         return []
     since = str(cfg.get("since") or "daily")
@@ -147,18 +211,24 @@ def fetch_github_trending(cfg: Dict[str, Any]) -> List[RepoItem]:
     out: List[RepoItem] = []
     for lang in langs:
         lang_slug = urllib.parse.quote(str(lang or "").strip())
-        path = f"https://github.com/trending/{lang_slug}?since={since}" if lang_slug else f"https://github.com/trending?since={since}"
+        path = (
+            f"https://github.com/trending/{lang_slug}?since={since}"
+            if lang_slug
+            else f"https://github.com/trending?since={since}"
+        )
         label = f"GitHub Trending({lang})" if lang_slug else "GitHub Trending"
         try:
-            _, html_text, _ = _http_get(path)
-            parsed = parse_github_trending_html(html_text, source_label=label)
+            _, html_text, _ = _http_get(path, proxy=proxy)
+            parsed = parse_github_trending_html(html_text, source_label=label, since=since)
             out.extend(parsed[:max_items])
         except Exception as exc:
             logger.warning("抓取 %s 失败: %s", label, exc)
     return out
 
 
-def fetch_github_search(cfg: Dict[str, Any]) -> List[RepoItem]:
+def fetch_github_search(
+    cfg: Dict[str, Any], *, proxy: str = "", github_token: str = ""
+) -> List[RepoItem]:
     if not cfg.get("enabled", True):
         return []
     now_utc = datetime.now(timezone.utc)
@@ -184,7 +254,12 @@ def fetch_github_search(cfg: Dict[str, Any]) -> List[RepoItem]:
             + f"&sort=stars&order=desc&per_page={per_page}"
         )
         try:
-            _, raw, _ = _http_get(url, headers={"Accept": "application/vnd.github+json"})
+            _, raw, _ = _http_get(
+                url,
+                headers={"Accept": "application/vnd.github+json"},
+                proxy=proxy,
+                github_token=github_token,
+            )
             js = json.loads(raw)
             for item in js.get("items") or []:
                 repo = _repo_from_gh_api(item, f"雷达:{name}")
@@ -195,7 +270,9 @@ def fetch_github_search(cfg: Dict[str, Any]) -> List[RepoItem]:
     return out
 
 
-def fetch_starred_developers(users: List[str]) -> List[RepoItem]:
+def fetch_starred_developers(
+    users: List[str], *, proxy: str = "", github_token: str = ""
+) -> List[RepoItem]:
     out: List[RepoItem] = []
     for u in users or []:
         uname = str(u).strip()
@@ -203,7 +280,12 @@ def fetch_starred_developers(users: List[str]) -> List[RepoItem]:
             continue
         url = f"https://api.github.com/users/{urllib.parse.quote(uname)}/starred?per_page=15"
         try:
-            _, raw, _ = _http_get(url, headers={"Accept": "application/vnd.github+json"})
+            _, raw, _ = _http_get(
+                url,
+                headers={"Accept": "application/vnd.github+json"},
+                proxy=proxy,
+                github_token=github_token,
+            )
             items = json.loads(raw)
             if isinstance(items, list):
                 for item in items:
@@ -215,14 +297,14 @@ def fetch_starred_developers(users: List[str]) -> List[RepoItem]:
     return out
 
 
-def fetch_hackernews_show(cfg: Dict[str, Any]) -> List[RepoItem]:
+def fetch_hackernews_show(cfg: Dict[str, Any], *, proxy: str = "") -> List[RepoItem]:
     if not cfg.get("enabled", True):
         return []
     limit = min(50, int(cfg.get("limit") or 30))
     url = f"https://hn.algolia.com/api/v1/search_by_date?tags=show_hn&hitsPerPage={limit}"
     out: List[RepoItem] = []
     try:
-        _, raw, _ = _http_get(url)
+        _, raw, _ = _http_get(url, proxy=proxy)
         hits = (json.loads(raw) or {}).get("hits") or []
         for h in hits:
             if not isinstance(h, dict):
@@ -251,14 +333,14 @@ def fetch_hackernews_show(cfg: Dict[str, Any]) -> List[RepoItem]:
     return out
 
 
-def fetch_hellogithub(cfg: Dict[str, Any]) -> List[RepoItem]:
+def fetch_hellogithub(cfg: Dict[str, Any], *, proxy: str = "") -> List[RepoItem]:
     if not cfg.get("enabled", True):
         return []
     limit = int(cfg.get("limit") or 25)
     url = "https://api.hellogithub.com/v1/?sort_by=featured&tid=&page=1"
     out: List[RepoItem] = []
     try:
-        _, raw, _ = _http_get(url)
+        _, raw, _ = _http_get(url, proxy=proxy)
         rows = (json.loads(raw) or {}).get("data") or []
         for r in rows[:limit]:
             if not isinstance(r, dict):
@@ -279,6 +361,98 @@ def fetch_hellogithub(cfg: Dict[str, Any]) -> List[RepoItem]:
             )
     except Exception as exc:
         logger.warning("抓取 HelloGitHub 失败: %s", exc)
+    return out
+
+
+def parse_huggingface_papers_json(raw_json: str, *, limit: int = 20) -> List[RepoItem]:
+    rows = json.loads(raw_json)
+    if not isinstance(rows, list):
+        return []
+    out: List[RepoItem] = []
+    for entry in rows[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        paper = entry.get("paper") or {}
+        if not isinstance(paper, dict):
+            continue
+        gh_url = str(paper.get("githubRepo") or "").strip()
+        repo_name = extract_github_repo_from_url(gh_url)
+        if not repo_name:
+            continue
+        title = str(entry.get("title") or paper.get("title") or "").strip()
+        paper_id = str(paper.get("id") or "").strip()
+        upvotes = int(paper.get("upvotes") or entry.get("numUpvotes") or 0)
+        stars_gh = int(paper.get("githubStars") or 0)
+        out.append(
+            RepoItem(
+                repo_name=repo_name,
+                url=f"https://github.com/{repo_name}",
+                description=title,
+                stars=max(stars_gh, upvotes),
+                sources=["HuggingFace Papers"],
+                discussion_url=f"https://huggingface.co/papers/{paper_id}" if paper_id else "",
+            )
+        )
+    return out
+
+
+def fetch_huggingface_papers(cfg: Dict[str, Any], *, proxy: str = "") -> List[RepoItem]:
+    if not cfg.get("enabled", False):
+        return []
+    limit = min(50, int(cfg.get("limit") or 20))
+    url = f"https://huggingface.co/api/daily_papers?limit={limit}"
+    try:
+        _, raw, _ = _http_get(url, proxy=proxy)
+        return parse_huggingface_papers_json(raw, limit=limit)
+    except Exception as exc:
+        logger.warning("抓取 HuggingFace Daily Papers 失败: %s", exc)
+        return []
+
+
+def parse_github_releases_atom(xml_text: str, repo_name: str) -> Optional[RepoItem]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    entry = root.find("a:entry", ns)
+    if entry is None:
+        return None
+    title = (entry.findtext("a:title", default="", namespaces=ns) or "").strip()
+    link_el = entry.find("a:link", ns)
+    rel_url = link_el.attrib.get("href", "") if link_el is not None else ""
+    updated = (entry.findtext("a:updated", default="", namespaces=ns) or "").strip()
+    tag = rel_url.rstrip("/").split("/")[-1] if "/releases/tag/" in rel_url else title
+    summary = _clean_html_text(entry.findtext("a:content", default="", namespaces=ns) or "")
+    desc = f"[Release {tag}] {title}" + (f" — {summary[:140]}" if summary else "")
+    return RepoItem(
+        repo_name=repo_name,
+        url=f"https://github.com/{repo_name}",
+        description=desc.strip(),
+        pushed_at=updated,
+        sources=["GitHub Releases"],
+        discussion_url=rel_url,
+        release_tag=tag[:40],
+    )
+
+
+def fetch_github_releases(cfg: Dict[str, Any], *, proxy: str = "") -> List[RepoItem]:
+    if not cfg.get("enabled", False):
+        return []
+    repos = cfg.get("repos") or []
+    out: List[RepoItem] = []
+    for raw_repo in repos:
+        repo_name = str(raw_repo or "").strip().strip("/")
+        if "/" not in repo_name:
+            continue
+        url = f"https://github.com/{repo_name}/releases.atom"
+        try:
+            _, xml_text, _ = _http_get(url, proxy=proxy)
+            item = parse_github_releases_atom(xml_text, repo_name)
+            if item:
+                out.append(item)
+        except Exception as exc:
+            logger.warning("抓取 %s Release 动态失败: %s", repo_name, exc)
     return out
 
 
@@ -331,49 +505,74 @@ def _parse_rss_or_atom(xml_text: str, source_label: str) -> List[RepoItem]:
     return out
 
 
-def fetch_reddit_and_extra_rss(reddit_cfg: Dict[str, Any], extra_urls: List[str]) -> List[RepoItem]:
+def fetch_reddit_and_extra_rss(
+    reddit_cfg: Dict[str, Any], extra_urls: List[str], *, proxy: str = ""
+) -> List[RepoItem]:
     out: List[RepoItem] = []
     if reddit_cfg.get("enabled", True):
+        base_url = str(reddit_cfg.get("rss_base_url") or "https://www.reddit.com").rstrip("/")
         for sub in reddit_cfg.get("subreddits") or []:
             s = str(sub).strip()
             if not s:
                 continue
-            url = f"https://www.reddit.com/r/{urllib.parse.quote(s)}/hot.rss?limit=20"
+            if "rsshub" in base_url:
+                url = f"{base_url.rstrip('/')}/{urllib.parse.quote(s)}"
+            else:
+                url = f"{base_url}/r/{urllib.parse.quote(s)}/hot.rss?limit=20"
             try:
                 _, xml_text, _ = _http_get(
-                    url, headers={"User-Agent": "linux:github-radar:v1.0 (by /u/radar_bot)"}
+                    url,
+                    headers={"User-Agent": "linux:github-radar:v1.0 (by /u/radar_bot)"},
+                    proxy=proxy,
                 )
                 out.extend(_parse_rss_or_atom(xml_text, f"Reddit:r/{s}"))
             except Exception as exc:
-                logger.info("Reddit r/%s 跳过（可能受机房访问限制）: %s", s, exc)
+                logger.info("Reddit r/%s 跳过（可能受网络或限流限制）: %s", s, exc)
 
     for raw_url in extra_urls or []:
         u = str(raw_url).strip()
         if not u:
             continue
         try:
-            _, xml_text, _ = _http_get(u)
+            _, xml_text, _ = _http_get(u, proxy=proxy)
             out.extend(_parse_rss_or_atom(xml_text, "自定义RSS"))
         except Exception as exc:
             logger.warning("抓取自定义 RSS %s 失败: %s", u, exc)
     return out
 
 
-def enrich_github_metadata(items: List[RepoItem], *, max_enrich: int = 20) -> None:
-    """Fill missing created_at / open_issues / language for non-API sources within unauthenticated rate limit."""
+def enrich_github_metadata(
+    items: List[RepoItem],
+    *,
+    max_enrich: Optional[int] = None,
+    proxy: str = "",
+    github_token: str = "",
+) -> None:
+    """Fill missing language / created_at / open_issues / topics / license within rate limits."""
+    limit = max_enrich if max_enrich is not None else (80 if github_token else 20)
+    # Prioritize items missing language or description (e.g. Show HN / HF Papers / Releases) first
+    prioritized = sorted(
+        items,
+        key=lambda r: (0 if (not r.language or not r.description or "Sponsor Star " in r.description) else 1),
+    )
     enriched = 0
-    for item in items:
-        if enriched >= max_enrich:
+    for item in prioritized:
+        if enriched >= limit:
             break
-        if item.created_at and item.language is not None:
+        if item.created_at and item.language is not None and (item.topics or item.license_name):
             continue
         url = f"https://api.github.com/repos/{item.repo_name}"
         try:
-            _, raw, hdrs = _http_get(url, headers={"Accept": "application/vnd.github+json"})
+            _, raw, hdrs = _http_get(
+                url,
+                headers={"Accept": "application/vnd.github+json"},
+                proxy=proxy,
+                github_token=github_token,
+            )
             js = json.loads(raw)
             if isinstance(js, dict) and js.get("full_name"):
                 item.repo_name = str(js["full_name"])
-                if not item.description and js.get("description"):
+                if js.get("description") and (not item.description or "Sponsor Star " in item.description):
                     item.description = str(js["description"]).strip()
                 if js.get("language"):
                     item.language = str(js["language"])
@@ -382,6 +581,12 @@ def enrich_github_metadata(items: List[RepoItem], *, max_enrich: int = 20) -> No
                 item.open_issues = int(js.get("open_issues_count") or item.open_issues)
                 item.created_at = str(js.get("created_at") or item.created_at)
                 item.pushed_at = str(js.get("pushed_at") or item.pushed_at)
+                if not item.topics and isinstance(js.get("topics"), list):
+                    item.topics = [str(t).strip() for t in js["topics"] if str(t).strip()][:6]
+                if not item.license_name and isinstance(js.get("license"), dict):
+                    spdx = str(js["license"].get("spdx_id") or "").strip()
+                    if spdx and spdx.upper() != "NOASSERTION":
+                        item.license_name = spdx
                 enriched += 1
             rem = int(hdrs.get("x-ratelimit-remaining") or 10)
             if rem <= 5:
@@ -392,17 +597,33 @@ def enrich_github_metadata(items: List[RepoItem], *, max_enrich: int = 20) -> No
             break
 
 
-def collect_all_sources(sources_cfg: Dict[str, Any]) -> List[RepoItem]:
+def collect_all_sources(
+    sources_cfg: Dict[str, Any], network_cfg: Optional[Dict[str, Any]] = None
+) -> List[RepoItem]:
+    proxy = resolve_proxy(network_cfg)
+    github_token = resolve_github_token(network_cfg)
+
     items: List[RepoItem] = []
-    items.extend(fetch_github_trending(sources_cfg.get("github_trending") or {}))
-    items.extend(fetch_github_search(sources_cfg.get("github_search") or {}))
-    items.extend(fetch_starred_developers(sources_cfg.get("starred_users") or []))
-    items.extend(fetch_hackernews_show(sources_cfg.get("hackernews_show") or {}))
-    items.extend(fetch_hellogithub(sources_cfg.get("hellogithub") or {}))
+    items.extend(fetch_github_trending(sources_cfg.get("github_trending") or {}, proxy=proxy))
+    items.extend(
+        fetch_github_search(
+            sources_cfg.get("github_search") or {}, proxy=proxy, github_token=github_token
+        )
+    )
+    items.extend(
+        fetch_starred_developers(
+            sources_cfg.get("starred_users") or [], proxy=proxy, github_token=github_token
+        )
+    )
+    items.extend(fetch_hackernews_show(sources_cfg.get("hackernews_show") or {}, proxy=proxy))
+    items.extend(fetch_hellogithub(sources_cfg.get("hellogithub") or {}, proxy=proxy))
+    items.extend(fetch_huggingface_papers(sources_cfg.get("huggingface_papers") or {}, proxy=proxy))
+    items.extend(fetch_github_releases(sources_cfg.get("github_releases") or {}, proxy=proxy))
     items.extend(
         fetch_reddit_and_extra_rss(
             sources_cfg.get("reddit_rss") or {},
             sources_cfg.get("extra_rss_urls") or [],
+            proxy=proxy,
         )
     )
     return items

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 import yaml
 
 
@@ -13,6 +13,8 @@ class RadarConfig:
     translation: Dict[str, Any] = field(default_factory=dict)
     ai_highlight: Dict[str, Any] = field(default_factory=dict)
     output: Dict[str, Any] = field(default_factory=dict)
+    network: Dict[str, Any] = field(default_factory=dict)
+    notifications: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "RadarConfig":
@@ -23,4 +25,6 @@ class RadarConfig:
             translation=dict(raw.get("translation") or {}),
             ai_highlight=dict(raw.get("ai_highlight") or {}),
             output=dict(raw.get("output") or {}),
+            network=dict(raw.get("network") or {}),
+            notifications=dict(raw.get("notifications") or {}),
         )
