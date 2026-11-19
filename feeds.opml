@@ -1,15 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <opml version="2.0">
   <head>
-    <title>GitHub 趣闻聚合订阅</title>
+    <title>GitHub Radar 每日开源精选订阅</title>
   </head>
   <body>
-    <outline text="GitHub 来源" title="GitHub 来源">
-      <outline type="rss" text="GitHub Trending（全语言精选）" title="GitHub Trending（全语言精选）" xmlUrl="http://feed-server:80/github_trending.xml" htmlUrl="https://github.com/trending"/>
-      <outline type="rss" text="GitHub 定向雷达 &amp; 开发者关注" title="GitHub 定向雷达 &amp; 开发者关注" xmlUrl="http://feed-server:80/github_radar.xml" htmlUrl="https://github.com/search"/>
+    <outline text="全源聚合" title="全源聚合">
+      <outline type="rss" text="GitHub Radar 全源精选" title="GitHub Radar 全源精选" xmlUrl="http://localhost:8088/feeds/all_discoveries.xml" htmlUrl="http://localhost:8088/"/>
     </outline>
-    <outline text="外部社区" title="外部社区">
-      <outline type="rss" text="开源社区发现（Show HN / HelloGitHub / Reddit）" title="开源社区发现（Show HN / HelloGitHub / Reddit）" xmlUrl="http://feed-server:80/community_picks.xml" htmlUrl="https://news.ycombinator.com/show"/>
+    <outline text="GitHub 分榜" title="GitHub 分榜">
+      <outline type="rss" text="GitHub Trending（全语言去噪）" title="GitHub Trending（全语言去噪）" xmlUrl="http://localhost:8088/feeds/github_trending.xml" htmlUrl="https://github.com/trending"/>
+      <outline type="rss" text="GitHub 黑马雷达 &amp; Release 追踪" title="GitHub 黑马雷达 &amp; Release 追踪" xmlUrl="http://localhost:8088/feeds/github_radar.xml" htmlUrl="https://github.com/search"/>
+    </outline>
+    <outline text="外部极客社区" title="外部极客社区">
+      <outline type="rss" text="开源社区发现（Show HN / HelloGitHub / HuggingFace / Reddit）" title="开源社区发现（Show HN / HelloGitHub / HuggingFace / Reddit）" xmlUrl="http://localhost:8088/feeds/community_picks.xml" htmlUrl="https://news.ycombinator.com/show"/>
     </outline>
   </body>
 </opml>

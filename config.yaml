@@ -1,9 +1,10 @@
 network:
   # 可选：代理地址（如 http://127.0.0.1:7897），也可通过环境变量 RADAR_PROXY 传入
   proxy: ""
-  # 可选：读取 GitHub Token 的环境变量名（提升 Search/元信息补充限流配额）
+  # 可选：读取 GitHub Token 的环境变量名（提升 Search/GraphQL 元信息补充限流配额，并支持 GitHub Models 免费导读）
   github_token_env: "GITHUB_TOKEN"
-  # max_enrich: 80
+  # max_enrich: 100
+  # max_workers: 6
 
 sources:
   github_trending:
@@ -27,7 +28,7 @@ sources:
         days_pushed: 5
         min_stars: 20
         max_stars: 400
-        per_page: 20
+        per_page: 35
 
   starred_users: []
 
@@ -72,18 +73,24 @@ filters:
   # 屏蔽高频刷榜或营销号作者/组织（owner）
   blacklist_owners: []
   blacklist_keywords:
-    # 1. 资源合集 / 笔记路线图
+    # 1. 资源合集 / 笔记路线图（英文短词自动按词边界匹配，避免误伤 virtual-list / garbage collection / kubernetes resources）
     - "awesome-"
-    - "awesome "
-    - "-list"
+    - "awesome-list"
+    - "list of awesome"
     - "curated-list"
     - "curated list"
+    - "reading-list"
+    - "resource-list"
     - "cheat-sheet"
     - "cheatsheet"
     - "roadmap"
-    - "collection"
+    - "link-collection"
+    - "resource-collection"
+    - "collection of links"
     - "bookmarks"
-    - "resources"
+    - "learning-resources"
+    - "study-resources"
+    - "free-resources"
     - "合集"
     - "资源汇总"
     - "路线图"
@@ -105,6 +112,7 @@ filters:
     - "真题"
     # 3. 纯教程 / 毕设模板
     - "tutorial"
+    - "tutorials"
     - "for-beginners"
     - "100-days-of-"
     - "step-by-step"
@@ -136,10 +144,13 @@ filters:
     - "领资料"
     - "日入"
     - "一键赚钱"
-    # 5. 白嫖节点 / 灰产脚本
+    # 5. 白嫖节点 / 盗版外挂壳仓 / 灰产脚本
     - "free-api"
     - "free-key"
     - "free-nodes"
+    - "free-soft"
+    - "free-download"
+    - "pre-activated"
     - "proxy-pool"
     - "v2ray"
     - "clash"
@@ -151,7 +162,11 @@ filters:
     - "薅羊毛"
     - "jd_scripts"
     - "crack"
+    - "cracked"
     - "keygen"
+    - "aimbot"
+    - "wallhack"
+    - "hwid-spoofer"
     - "激活码"
     - "破解"
 
@@ -161,14 +176,19 @@ translation:
 
 ai_highlight:
   enabled: true
-  # auto: 优先读取 OpenAI 兼容 API Key (RADAR_AI_API_KEY / OPENAI_API_KEY)，否则自动降级检测 agy CLI
+  # auto: 优先读取 OpenAI 兼容 API Key，其次自动使用 GITHUB_TOKEN 调 GitHub Models，最后回退本地 agy CLI
   provider: "auto"
   base_url: "https://api.openai.com/v1"
   openai_model: "gpt-4o-mini"
+  github_model: "openai/gpt-4o-mini"
+  github_models_batch_items: 10
+  use_github_models: true
   api_key_env: "RADAR_AI_API_KEY"
   agy_executable: "agy"
   model: "gemini-4-hydrogen-medium"
   max_batch_items: 25
+  max_chunks_per_run: 8
+  backfill_limit: 40
   timeout_seconds: 90
 
 notifications:
@@ -181,10 +201,13 @@ notifications:
   min_sources: 1
   min_stars: 0
   top_n: 10
+  max_category_share: 0.45
   languages: []
   keywords: []
 
 output:
   max_feed_items: 120
   max_web_items: 300
+  # 单一主题在每屏/榜单中的配额上限（0.40 = 单类最多占 40%，防止 AI 刷屏淹没底层工具；设为 0 关闭）
+  max_category_share: 0.40
   public_base_url: "http://localhost:8088/feeds"

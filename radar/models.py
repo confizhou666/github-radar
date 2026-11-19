@@ -27,6 +27,9 @@ class RepoItem:
     topics: List[str] = field(default_factory=list)
     license_name: str = ""
     release_tag: str = ""
+    community_score: int = 0
+    metadata_enriched: bool = False
+    star_history: List[int] = field(default_factory=list)
 
     @property
     def canonical_key(self) -> str:

@@ -2,6 +2,9 @@
   "use strict";
 
   const STORAGE_KEY = "github_radar_reader_v1";
+  const SAFE_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+  const VALID_BUCKETS = new Set(["all", "trending", "radar", "community", "saved"]);
+  const VALID_SORTS = new Set(["newest", "delta", "breakout", "stars"]);
 
   const LANG_COLORS = {
     Python: "#3572A5",
@@ -53,8 +56,13 @@
     readmeCache: new Map(),
   };
 
+  let suppressUrlSync = false;
+
   const els = {
     issueMeta: document.getElementById("issueMeta"),
+    sourceHealthPill: document.getElementById("sourceHealthPill"),
+    editorialBrief: document.getElementById("editorialBrief"),
+    editorialBriefText: document.getElementById("editorialBriefText"),
     bucketTabs: document.getElementById("bucketTabs"),
     searchInput: document.getElementById("searchInput"),
     langSelect: document.getElementById("langSelect"),
@@ -64,6 +72,7 @@
     categoryRibbon: document.getElementById("categoryRibbon"),
     filterStatus: document.getElementById("filterStatus"),
     filterStatusText: document.getElementById("filterStatusText"),
+    btnCopyFilterUrl: document.getElementById("btnCopyFilterUrl"),
     btnResetFilters: document.getElementById("btnResetFilters"),
     cardGrid: document.getElementById("cardGrid"),
     emptyState: document.getElementById("emptyState"),
@@ -122,10 +131,29 @@
       .replace(/'/g, "&#39;");
   }
 
+  function safeHttpUrl(raw) {
+    if (!raw) return "";
+    try {
+      const u = new URL(String(raw).trim());
+      if (u.protocol === "http:" || u.protocol === "https:") {
+        return u.href;
+      }
+    } catch {
+      // ignore invalid URL
+    }
+    return "";
+  }
+
   function formatStars(n) {
     const num = Number(n) || 0;
     if (num >= 1000) return `${(num / 1000).toFixed(1)}k`;
     return String(num);
+  }
+
+  function formatBreakout(score) {
+    const val = Number(score) || 0;
+    if (val >= 100) return `${Math.round(val)}`;
+    return val.toFixed(1);
   }
 
   function formatShortDate(iso) {
@@ -170,6 +198,42 @@
     return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
   }
 
+  function renderSparklineSvg(points, { width = 58, height = 18 } = {}) {
+    if (!Array.isArray(points) || points.length < 2) return "";
+    const nums = points.map((n) => Number(n) || 0);
+    const min = Math.min(...nums);
+    const max = Math.max(...nums);
+    const isFlat = max === min;
+    const padX = 2;
+    const padY = 2.5;
+    const innerW = width - padX * 2;
+    const innerH = height - padY * 2;
+    const span = max - min || 1;
+
+    const coords = nums.map((val, idx) => {
+      const x = padX + (idx / (nums.length - 1)) * innerW;
+      const y = isFlat
+        ? height / 2
+        : padY + innerH - ((val - min) / span) * innerH;
+      return [Number(x.toFixed(1)), Number(y.toFixed(1))];
+    });
+
+    const linePts = coords.map(([x, y]) => `${x},${y}`).join(" ");
+    const [lastX, lastY] = coords[coords.length - 1];
+    const areaPts = `${coords[0][0]},${height - 1} ${linePts} ${lastX},${height - 1}`;
+    const tip = `近期 Star 轨迹: ${nums[0].toLocaleString()} → ${nums[nums.length - 1].toLocaleString()}`;
+
+    return `
+      <span class="sparkline-wrap ${isFlat ? "is-flat" : ""}" title="${escapeHtml(tip)}" aria-hidden="true">
+        <svg class="sparkline-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+          ${!isFlat ? `<polygon points="${areaPts}" fill="currentColor" fill-opacity="0.11"></polygon>` : ""}
+          <polyline points="${linePts}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></polyline>
+          <circle cx="${lastX}" cy="${lastY}" r="1.9" fill="currentColor"></circle>
+        </svg>
+      </span>
+    `;
+  }
+
   function copyText(text, successMsg = "已复制到剪贴板") {
     if (navigator.clipboard && window.isSecureContext) {
       navigator.clipboard.writeText(text).then(
@@ -207,6 +271,81 @@
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  }
+
+  /* ---------- URL Deep-Link State Sync ---------- */
+  function buildShareableUrl() {
+    const u = new URL(window.location.href);
+    const p = new URLSearchParams();
+    if (state.bucket && state.bucket !== "all") p.set("bucket", state.bucket);
+    if (state.category) p.set("cat", state.category);
+    if (state.language) p.set("lang", state.language);
+    if (state.search.trim()) p.set("q", state.search.trim());
+    if (state.sort && state.sort !== "newest") p.set("sort", state.sort);
+    if (state.multiOnly) p.set("multi", "1");
+    if (state.drawerKey) {
+      const openItem = getItemByKey(state.drawerKey);
+      p.set("repo", openItem ? openItem.repo_name : state.drawerKey);
+    }
+    const qs = p.toString();
+    u.search = qs ? `?${qs}` : "";
+    return u.toString();
+  }
+
+  function syncUrlState() {
+    if (suppressUrlSync) return;
+    try {
+      const nextUrl = buildShareableUrl();
+      if (nextUrl !== window.location.href) {
+        window.history.replaceState(null, "", nextUrl);
+      }
+    } catch {
+      // ignore file:// or restricted history errors
+    }
+  }
+
+  function syncControlsFromState() {
+    els.bucketTabs.querySelectorAll(".tab-btn").forEach((b) => {
+      const active = (b.dataset.bucket || "all") === state.bucket;
+      b.classList.toggle("is-active", active);
+      b.setAttribute("aria-selected", String(active));
+    });
+    els.searchInput.value = state.search;
+    els.langSelect.value = state.language;
+    els.sortSelect.value = state.sort;
+    els.btnMultiSource.setAttribute("aria-pressed", String(state.multiOnly));
+    els.btnHideRead.setAttribute("aria-pressed", String(state.hideRead));
+  }
+
+  function applyUrlStateToView() {
+    suppressUrlSync = true;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const b = params.get("bucket") || "all";
+      state.bucket = VALID_BUCKETS.has(b) ? b : "all";
+      state.category = params.get("cat") || "";
+      state.language = params.get("lang") || "";
+      state.search = params.get("q") || "";
+      const srt = params.get("sort") || "newest";
+      state.sort = VALID_SORTS.has(srt) ? srt : "newest";
+      state.multiOnly = params.get("multi") === "1" || params.get("multi") === "true";
+
+      populateLanguages();
+      syncControlsFromState();
+      renderCards();
+
+      const repoParam = (params.get("repo") || "").trim().toLowerCase();
+      if (repoParam) {
+        const target = getItemByKey(repoParam);
+        if (target) {
+          openDrawer(target.key);
+        }
+      } else if (state.drawerKey) {
+        closeDrawer();
+      }
+    } finally {
+      suppressUrlSync = false;
+    }
   }
 
   function loadLocalPrefs() {
@@ -259,6 +398,93 @@
     state.theme = state.theme === "dark" ? "light" : "dark";
     applyTheme();
     saveLocalPrefs();
+  }
+
+  function renderEditorialAndHealth() {
+    const summary = String(state.status.trend_summary || "").trim();
+    if (summary && els.editorialBrief && els.editorialBriefText) {
+      els.editorialBriefText.textContent = summary;
+      els.editorialBrief.hidden = false;
+    } else if (els.editorialBrief) {
+      els.editorialBrief.hidden = true;
+    }
+
+    const health = state.status.source_health;
+    if (health && typeof health === "object" && els.sourceHealthPill) {
+      const entries = Object.entries(health);
+      if (entries.length > 0) {
+        const okCount = entries.filter(([, v]) => v && v.ok).length;
+        const details = entries
+          .map(([k, v]) => `${k}: ${v && v.ok ? `正常 (${v.count ?? 0}条)` : `异常 (${v?.error || "失败"})`}`)
+          .join("\n");
+        els.sourceHealthPill.textContent = `信源 ${okCount}/${entries.length} 在线`;
+        els.sourceHealthPill.title = details;
+        els.sourceHealthPill.classList.toggle("has-warn", okCount < entries.length);
+        els.sourceHealthPill.hidden = false;
+        return;
+      }
+    }
+    if (els.sourceHealthPill) els.sourceHealthPill.hidden = true;
+  }
+
+  function normalizeMacroCategory(tag) {
+    const t = String(tag || "").trim();
+    if (!t) return "";
+    const up = t.toUpperCase();
+    if (
+      /(?<![A-Z])(AI|LLM|AGENT|RAG|GPT|AIGC)(?![A-Z])/.test(up) ||
+      t.includes("智能") ||
+      t.includes("模型") ||
+      t.includes("深度学习") ||
+      t.includes("机器学习") ||
+      t.includes("多模态")
+    ) {
+      return "AI";
+    }
+    return t;
+  }
+
+  function interleaveCategoryQuota(items, maxShare, windowSize = 10) {
+    if (!(maxShare > 0 && maxShare < 1) || items.length < 5) return items;
+    const nonEmptyMacros = new Set(
+      items.map((r) => normalizeMacroCategory(r.category_tag)).filter(Boolean)
+    );
+    if (nonEmptyMacros.size < 2) return items;
+
+    const maxPerWin = Math.max(1, Math.round(windowSize * maxShare));
+    const remaining = [...items];
+    const selected = [];
+    const deferred = [];
+
+    while (remaining.length > 0) {
+      const winStart = Math.floor(selected.length / windowSize) * windowSize;
+      const winCounts = new Map();
+      for (let i = winStart; i < selected.length; i += 1) {
+        const mc = normalizeMacroCategory(selected[i].category_tag);
+        if (mc) winCounts.set(mc, (winCounts.get(mc) || 0) + 1);
+      }
+
+      let pickedIdx = -1;
+      for (let idx = 0; idx < remaining.length; idx += 1) {
+        const mc = normalizeMacroCategory(remaining[idx].category_tag);
+        if (!mc || (winCounts.get(mc) || 0) < maxPerWin) {
+          pickedIdx = idx;
+          break;
+        }
+      }
+
+      if (pickedIdx >= 0) {
+        selected.push(remaining.splice(pickedIdx, 1)[0]);
+      } else {
+        const remMacros = new Set(remaining.map((r) => normalizeMacroCategory(r.category_tag)));
+        if (remMacros.size <= 1) {
+          selected.push(remaining.shift());
+        } else {
+          deferred.push(remaining.shift());
+        }
+      }
+    }
+    return selected.concat(deferred);
   }
 
   function getVisibleBaseItems() {
@@ -314,6 +540,14 @@
     const sorted = [...list];
     if (state.sort === "stars") {
       sorted.sort((a, b) => (b.stars || 0) - (a.stars || 0));
+    } else if (state.sort === "breakout") {
+      sorted.sort((a, b) => {
+        const br = (b.breakout_score || 0) - (a.breakout_score || 0);
+        if (br !== 0) return br;
+        const dd = (b.stars_delta_24h || 0) - (a.stars_delta_24h || 0);
+        if (dd !== 0) return dd;
+        return (b.stars || 0) - (a.stars || 0);
+      });
     } else if (state.sort === "delta") {
       sorted.sort((a, b) => {
         const dd = (b.stars_delta_24h || 0) - (a.stars_delta_24h || 0);
@@ -328,12 +562,23 @@
         const dB = getLocalDateKey(b.discovered_at);
         const dayCmp = dB.localeCompare(dA);
         if (dayCmp !== 0) return dayCmp;
-        const ms = (b.sources || []).length - (a.sources || []).length;
-        if (ms !== 0) return ms;
-        const dd = (b.stars_delta_24h || 0) - (a.stars_delta_24h || 0);
-        if (dd !== 0) return dd;
-        return (b.stars || 0) - (a.stars || 0);
+        return (a._rank ?? 0) - (b._rank ?? 0);
       });
+
+      const maxShare = Number(state.status.max_category_share ?? 0.4);
+      if (!state.category && !q && maxShare > 0 && maxShare < 1 && sorted.length >= 5) {
+        const byDay = new Map();
+        for (const it of sorted) {
+          const dk = getLocalDateKey(it.discovered_at);
+          if (!byDay.has(dk)) byDay.set(dk, []);
+          byDay.get(dk).push(it);
+        }
+        const rebalanced = [];
+        for (const dayList of byDay.values()) {
+          rebalanced.push(...interleaveCategoryQuota(dayList, maxShare));
+        }
+        return rebalanced;
+      }
     }
     return sorted;
   }
@@ -378,6 +623,12 @@
       opt.textContent = `${lang} (${count})`;
       els.langSelect.appendChild(opt);
     }
+    if (current && !freq.has(current)) {
+      const extra = document.createElement("option");
+      extra.value = current;
+      extra.textContent = `${current} (0)`;
+      els.langSelect.appendChild(extra);
+    }
     els.langSelect.value = current;
   }
 
@@ -400,7 +651,11 @@
       .sort((a, b) => b[1] - a[1])
       .slice(0, 10);
 
-    if (topCats.length <= 1) {
+    if (state.category && !topCats.some(([tag]) => tag === state.category)) {
+      topCats.push([state.category, freq.get(state.category) || 0]);
+    }
+
+    if (topCats.length === 0 || (topCats.length === 1 && !state.category)) {
       els.categoryRibbon.innerHTML = "";
       return;
     }
@@ -420,6 +675,7 @@
     if (state.category) activeParts.push(`主题「${state.category}」`);
     if (state.language) activeParts.push(`语言「${state.language}」`);
     if (state.search.trim()) activeParts.push(`关键词「${state.search.trim()}」`);
+    if (state.sort === "breakout") activeParts.push("按黑马爆发度排序");
     if (state.multiOnly) activeParts.push("仅看多源共振");
     if (state.hideRead && state.bucket !== "saved") activeParts.push("仅看未读");
 
@@ -453,6 +709,18 @@
     const secondaryText = pickCardSecondaryText(item, primaryText);
     const sourceCount = (item.sources || []).length;
     const delta24 = Number(item.stars_delta_24h || 0);
+    const breakout = Number(item.breakout_score || 0);
+    const ageDays = item.age_days != null ? Number(item.age_days) : null;
+    const showBreakout =
+      (state.sort === "breakout" && breakout > 0) ||
+      (ageDays !== null && ageDays <= 21 && breakout >= 18);
+
+    const safeRepoUrl = safeHttpUrl(item.url);
+    const safeDiscUrl = safeHttpUrl(item.discussion_url);
+    const sparkSvg =
+      Array.isArray(item.sparkline) && item.sparkline.length >= 2
+        ? renderSparklineSvg(item.sparkline, { width: 54, height: 16 })
+        : "";
 
     const cardClasses = [
       "repo-card",
@@ -478,11 +746,12 @@
                 ? `<span class="lang-badge"><span class="lang-dot" style="background:${langColor}"></span>${escapeHtml(item.language)}</span>`
                 : ""
             }
-            <span class="star-badge" title="${item.stars.toLocaleString()} Stars">
+            <span class="star-badge" title="${(item.stars || 0).toLocaleString()} Stars">
               <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M12 2.6l2.9 5.88 6.5.94-4.7 4.58 1.1 6.47L12 17.4l-5.8 3.07 1.1-6.47-4.7-4.58 6.5-.94L12 2.6z"/></svg>
               ${formatStars(item.stars)}
             </span>
             ${delta24 > 0 ? `<span class="delta-badge" title="近 24h 新增 ${delta24.toLocaleString()} Stars">+${formatStars(delta24)}</span>` : ""}
+            ${showBreakout ? `<span class="breakout-badge" title="黑马爆发指数：日均 ${breakout.toFixed(1)} Stars${ageDays !== null ? `（创仓 ${Math.max(1, Math.round(ageDays))} 天）` : ""}">⚡${formatBreakout(breakout)}/d</span>` : ""}
           </div>
         </div>
 
@@ -497,9 +766,12 @@
         </div>
 
         <div class="card-footer">
-          <div class="card-date" title="发现于 ${escapeHtml(formatFullTime(item.discovered_at))}">
-            <span class="unread-dot" aria-hidden="true"></span>
-            <span>${formatShortDate(item.discovered_at)}</span>
+          <div class="card-meta-left">
+            <div class="card-date" title="发现于 ${escapeHtml(formatFullTime(item.discovered_at))}">
+              <span class="unread-dot" aria-hidden="true"></span>
+              <span>${formatShortDate(item.discovered_at)}</span>
+            </div>
+            ${sparkSvg}
           </div>
 
           <div class="card-actions">
@@ -513,11 +785,15 @@
               <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
             </button>
             ${
-              item.discussion_url
-                ? `<a class="action-btn link-pill" href="${escapeHtml(item.discussion_url)}" target="_blank" rel="noopener noreferrer" data-action="link" title="打开社区讨论 / Release">讨论</a>`
+              safeDiscUrl
+                ? `<a class="action-btn link-pill" href="${escapeHtml(safeDiscUrl)}" target="_blank" rel="noopener noreferrer" data-action="link" title="打开社区讨论 / Release">讨论</a>`
                 : ""
             }
-            <a class="action-btn link-pill" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer" data-action="link" title="在新标签页打开 GitHub 仓库">GitHub ↗</a>
+            ${
+              safeRepoUrl
+                ? `<a class="action-btn link-pill" href="${escapeHtml(safeRepoUrl)}" target="_blank" rel="noopener noreferrer" data-action="link" title="在新标签页打开 GitHub 仓库">GitHub ↗</a>`
+                : ""
+            }
           </div>
         </div>
       </article>
@@ -530,6 +806,7 @@
 
     const filtered = getFilteredItems();
     renderFilterStatus(filtered.length);
+    syncUrlState();
 
     if (filtered.length === 0) {
       els.cardGrid.innerHTML = "";
@@ -556,7 +833,6 @@
       filtered.length >= 4;
 
     if (state.sort === "newest") {
-      // Group by discovery date for magazine issue timeline feel
       const groups = new Map();
       for (const item of filtered) {
         const dk = getLocalDateKey(item.discovered_at);
@@ -586,7 +862,8 @@
   }
 
   function getItemByKey(key) {
-    return state.items.find((it) => it.key === key) || null;
+    const k = String(key || "").toLowerCase();
+    return state.items.find((it) => it.key === k) || null;
   }
 
   /* ---------- Drawer Logic ---------- */
@@ -626,19 +903,23 @@
     const item = getItemByKey(key);
     if (!item) return;
 
-    state.drawerKey = key;
-    if (!state.read.has(key)) {
-      state.read.add(key);
+    state.drawerKey = item.key;
+    syncUrlState();
+
+    if (!state.read.has(item.key)) {
+      state.read.add(item.key);
       saveLocalPrefs();
-      const cardEl = els.cardGrid.querySelector(`[data-key="${CSS.escape(key)}"]`);
+      const cardEl = els.cardGrid.querySelector(`[data-key="${CSS.escape(item.key)}"]`);
       if (cardEl) cardEl.classList.add("is-read");
     }
 
-    els.cardGrid.querySelectorAll(".repo-card.is-active-drawer").forEach((el) => el.classList.remove("is-active-drawer"));
-    const activeCard = els.cardGrid.querySelector(`[data-key="${CSS.escape(key)}"]`);
+    els.cardGrid
+      .querySelectorAll(".repo-card.is-active-drawer")
+      .forEach((el) => el.classList.remove("is-active-drawer"));
+    const activeCard = els.cardGrid.querySelector(`[data-key="${CSS.escape(item.key)}"]`);
     if (activeCard) activeCard.classList.add("is-active-drawer");
 
-    const idx = state.drawerListKeys.indexOf(key);
+    const idx = state.drawerListKeys.indexOf(item.key);
     els.drawerPos.textContent = `${idx + 1} / ${state.drawerListKeys.length}`;
     els.btnPrevItem.disabled = idx <= 0;
     els.btnNextItem.disabled = idx < 0 || idx >= state.drawerListKeys.length - 1;
@@ -649,7 +930,20 @@
     const cachedReadme = state.readmeCache.get(item.key);
     const delta24 = Number(item.stars_delta_24h || 0);
     const delta7d = Number(item.stars_delta_7d || 0);
+    const breakout = Number(item.breakout_score || 0);
+    const ageDays = item.age_days != null ? Number(item.age_days) : null;
     const topics = Array.isArray(item.topics) ? item.topics : [];
+    const safeRepoUrl = safeHttpUrl(item.url);
+    const safeDiscUrl = safeHttpUrl(item.discussion_url);
+
+    const ogSeed = encodeURIComponent(state.status.last_run_date || "1");
+    const ogCardUrl = SAFE_REPO_RE.test(item.repo_name)
+      ? `https://opengraph.githubassets.com/${ogSeed}/${item.repo_name}`
+      : "";
+
+    const sparkPoints = Array.isArray(item.sparkline) ? item.sparkline : [];
+    const drawerSparkSvg =
+      sparkPoints.length >= 2 ? renderSparklineSvg(sparkPoints, { width: 148, height: 32 }) : "";
 
     els.drawerBody.innerHTML = `
       <div class="drawer-tags">
@@ -663,10 +957,18 @@
       ${item.owner ? `<div class="drawer-owner">${escapeHtml(item.owner)} /</div>` : ""}
       <h2 class="drawer-title">${escapeHtml(item.name || item.repo_name)}</h2>
 
+      ${
+        ogCardUrl
+          ? `<div class="drawer-og-wrap" id="drawerOgWrap">
+              <img class="drawer-og-img" id="drawerOgImg" src="${escapeHtml(ogCardUrl)}" alt="${escapeHtml(item.repo_name)} GitHub 预览卡" loading="lazy" />
+            </div>`
+          : ""
+      }
+
       <div class="drawer-metrics">
-        <span>★ ${item.stars.toLocaleString()} Stars${delta24 > 0 ? ` <span class="delta-badge">+${delta24.toLocaleString()} / 24h</span>` : ""}</span>
+        <span>★ ${(item.stars || 0).toLocaleString()} Stars${delta24 > 0 ? ` <span class="delta-badge">+${delta24.toLocaleString()} / 24h</span>` : ""}</span>
         ${delta7d > delta24 ? `<span>7d +${delta7d.toLocaleString()}</span>` : ""}
-        <span>⑂ ${item.forks.toLocaleString()} Forks</span>
+        <span>⑂ ${(item.forks || 0).toLocaleString()} Forks</span>
         ${item.open_issues > 0 ? `<span>◎ ${item.open_issues.toLocaleString()} Issues</span>` : ""}
         ${
           item.language
@@ -674,9 +976,34 @@
             : ""
         }
         ${item.license_name ? `<span>⚖ ${escapeHtml(item.license_name)}</span>` : ""}
+        ${ageDays !== null ? `<span>创仓 ${Math.max(1, Math.round(ageDays))} 天</span>` : ""}
         ${item.pushed_at ? `<span>最近提交 ${escapeHtml(formatShortDate(item.pushed_at))}</span>` : ""}
         <span>收录 ${escapeHtml(formatFullTime(item.discovered_at))}</span>
       </div>
+
+      ${
+        drawerSparkSvg || breakout > 0
+          ? `<div class="drawer-trend-strip">
+              <div class="drawer-trend-meta">
+                <span class="drawer-trend-label">7 日快照轨迹</span>
+                <span class="drawer-trend-val">${
+                  sparkPoints.length >= 2
+                    ? `${Number(sparkPoints[0]).toLocaleString()} → ${Number(sparkPoints[sparkPoints.length - 1]).toLocaleString()} ★`
+                    : `当前 ${(item.stars || 0).toLocaleString()} ★`
+                }</span>
+              </div>
+              ${
+                breakout > 0
+                  ? `<div class="drawer-trend-meta">
+                      <span class="drawer-trend-label">黑马爆发指数</span>
+                      <span class="drawer-trend-val">🚀 ${breakout.toFixed(1)} ★/天</span>
+                    </div>`
+                  : ""
+              }
+              ${drawerSparkSvg}
+            </div>`
+          : ""
+      }
 
       ${
         topics.length
@@ -717,7 +1044,7 @@
 
       <section class="readme-section">
         <div class="readme-head">
-          <div class="drawer-section-label" style="margin:0">README 速览</div>
+          <div class="drawer-section-label" style="margin:0">README 速览（零限流 CDN 优先）</div>
           <button type="button" class="btn-outline small" id="btnLoadReadme">
             ${cachedReadme ? "已加载" : "在线拉取 README 预览"}
           </button>
@@ -730,13 +1057,18 @@
 
     els.drawerFooter.innerHTML = `
       <div class="drawer-footer-left">
-        <a class="btn-primary" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">前往 GitHub ↗</a>
         ${
-          item.discussion_url
-            ? `<a class="btn-outline" style="display:inline-flex;align-items:center;" href="${escapeHtml(item.discussion_url)}" target="_blank" rel="noopener noreferrer">社区讨论 ↗</a>`
+          safeRepoUrl
+            ? `<a class="btn-primary" href="${escapeHtml(safeRepoUrl)}" target="_blank" rel="noopener noreferrer">前往 GitHub ↗</a>`
+            : ""
+        }
+        ${
+          safeDiscUrl
+            ? `<a class="btn-outline" style="display:inline-flex;align-items:center;" href="${escapeHtml(safeDiscUrl)}" target="_blank" rel="noopener noreferrer">社区讨论 ↗</a>`
             : ""
         }
         <button type="button" class="btn-outline small" id="btnCopyClone">复制 clone</button>
+        <button type="button" class="btn-outline small" id="btnShareRepo" title="复制指向该项目的深链地址">分享深链</button>
       </div>
       <div class="drawer-footer-right">
         <button type="button" class="btn-outline small" id="btnDrawerSave" style="${isSaved ? "border-color:var(--accent);color:var(--accent);" : ""}">
@@ -748,6 +1080,14 @@
     `;
 
     els.drawerBody.scrollTop = 0;
+
+    const ogImg = document.getElementById("drawerOgImg");
+    const ogWrap = document.getElementById("drawerOgWrap");
+    if (ogImg && ogWrap) {
+      ogImg.addEventListener("error", () => {
+        ogWrap.hidden = true;
+      });
+    }
 
     const btnLoadReadme = document.getElementById("btnLoadReadme");
     if (btnLoadReadme && !cachedReadme) {
@@ -764,7 +1104,14 @@
     });
 
     document.getElementById("btnCopyClone").addEventListener("click", () => {
-      copyText(`git clone ${item.url}.git`, "已复制 git clone 命令");
+      const cloneBase = SAFE_REPO_RE.test(item.repo_name)
+        ? `https://github.com/${item.repo_name}.git`
+        : `${safeRepoUrl}.git`;
+      copyText(`git clone ${cloneBase}`, "已复制 git clone 命令");
+    });
+
+    document.getElementById("btnShareRepo").addEventListener("click", () => {
+      copyText(buildShareableUrl(), "已复制项目分享深链");
     });
 
     document.getElementById("btnDrawerSave").addEventListener("click", () => {
@@ -789,6 +1136,34 @@
     });
   }
 
+  async function fetchReadmeTextWithFallback(repoName) {
+    if (!SAFE_REPO_RE.test(repoName)) {
+      throw new Error("非法的仓库标识符");
+    }
+    const cdnCandidates = [
+      `https://raw.githubusercontent.com/${repoName}/HEAD/README.md`,
+      `https://raw.githubusercontent.com/${repoName}/HEAD/readme.md`,
+    ];
+    for (const cdnUrl of cdnCandidates) {
+      try {
+        const r = await fetch(cdnUrl);
+        if (r.ok) {
+          return await r.text();
+        }
+      } catch {
+        // try next candidate
+      }
+    }
+
+    const apiResp = await fetch(`https://api.github.com/repos/${repoName}/readme`, {
+      headers: { Accept: "application/vnd.github.raw+json" },
+    });
+    if (!apiResp.ok) {
+      throw new Error(`HTTP ${apiResp.status}`);
+    }
+    return await apiResp.text();
+  }
+
   async function loadReadmePreview(item) {
     const btn = document.getElementById("btnLoadReadme");
     const box = document.getElementById("readmeContent");
@@ -797,13 +1172,7 @@
     btn.disabled = true;
     btn.textContent = "拉取中…";
     try {
-      const resp = await fetch(`https://api.github.com/repos/${item.repo_name}/readme`, {
-        headers: { Accept: "application/vnd.github.raw+json" },
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const md = await resp.text();
+      const md = await fetchReadmeTextWithFallback(item.repo_name);
       const rendered = renderSafeMarkdown(md.slice(0, 12000), item.repo_name);
       state.readmeCache.set(item.key, rendered);
       if (state.drawerKey === item.key) {
@@ -812,7 +1181,7 @@
       }
     } catch (err) {
       if (state.drawerKey === item.key) {
-        box.innerHTML = `<p style="color:var(--ink-muted)">在线拉取失败（${escapeHtml(err.message)}，可能是 GitHub 匿名接口限流或网络阻断），可直接点击下方「前往 GitHub」查看完整文档。</p>`;
+        box.innerHTML = `<p style="color:var(--ink-muted)">在线拉取失败（${escapeHtml(err.message)}，可能是网络阻断或仓库无 README），可直接点击下方「前往 GitHub」查看完整文档。</p>`;
         btn.disabled = false;
         btn.textContent = "重试预览";
       }
@@ -834,16 +1203,52 @@
     };
 
     const inlineFormat = (raw) => {
-      let s = escapeHtml(raw);
-      s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
-      s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, src) => {
-        const cleanUrl = resolveGithubAssetUrl(src, repoName);
-        if (!cleanUrl) return "";
-        return `<img alt="${alt}" src="${escapeHtml(cleanUrl)}" loading="lazy" />`;
-      });
-      s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-      s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-      return s;
+      const tokens = [];
+      const putToken = (htmlSnippet) => {
+        const key = `\x00TOK_${tokens.length}\x00`;
+        tokens.push([key, htmlSnippet]);
+        return key;
+      };
+
+      // 1. Strip any literal NUL chars and tokenize inline code first
+      let working = String(raw ?? "")
+        .replace(/\x00/g, "")
+        .replace(/`([^`]+)`/g, (_, code) => putToken(`<code>${escapeHtml(code)}</code>`));
+
+      // 2. Tokenize images BEFORE HTML-escaping so '&' in badge query params is never double-escaped
+      working = working.replace(
+        /!\[([^\]]*)\]\(((?:[^\s()]+|\([^\s()]*\))+)\)/g,
+        (_, alt, rawSrc) => {
+          const cleanUrl = resolveGithubAssetUrl(rawSrc, repoName);
+          if (!cleanUrl) return "";
+          return putToken(
+            `<img alt="${escapeHtml(alt)}" src="${escapeHtml(cleanUrl)}" loading="lazy" />`
+          );
+        }
+      );
+
+      // 3. Tokenize links (supporting nested badge/code tokens and relative repo docs) with http/https validation
+      working = working.replace(
+        /\[([^\]]+)\]\(((?:[^\s()]+|\([^\s()]*\))+)\)/g,
+        (_, label, rawHref) => {
+          const cleanHref = resolveGithubDocUrl(rawHref, repoName);
+          if (!cleanHref) return label;
+          return putToken(
+            `<a href="${escapeHtml(cleanHref)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`
+          );
+        }
+      );
+
+      // 4. Escape remaining plain text and apply bold formatting
+      let safe = escapeHtml(working);
+      safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+
+      // Expand outer tokens before inner nested tokens (e.g., clickable shield badges & linked inline code)
+      for (let i = tokens.length - 1; i >= 0; i -= 1) {
+        const [key, htmlSnippet] = tokens[i];
+        safe = safe.split(key).join(htmlSnippet);
+      }
+      return safe;
     };
 
     for (const line of lines) {
@@ -898,10 +1303,21 @@
   }
 
   function resolveGithubAssetUrl(src, repoName) {
-    if (/^https?:\/\//i.test(src)) return src;
-    if (src.startsWith("#") || src.startsWith("data:")) return "";
+    if (!src) return "";
+    if (/^https?:\/\//i.test(src)) return safeHttpUrl(src);
+    if (src.startsWith("#") || /^[a-zA-Z][a-zA-Z0-9+.-]*:/i.test(src)) return "";
+    if (!SAFE_REPO_RE.test(repoName)) return "";
     const clean = src.replace(/^\.?\//, "");
-    return `https://raw.githubusercontent.com/${repoName}/HEAD/${clean}`;
+    return safeHttpUrl(`https://raw.githubusercontent.com/${repoName}/HEAD/${clean}`);
+  }
+
+  function resolveGithubDocUrl(href, repoName) {
+    if (!href) return "";
+    if (/^https?:\/\//i.test(href)) return safeHttpUrl(href);
+    if (href.startsWith("#") || /^[a-zA-Z][a-zA-Z0-9+.-]*:/i.test(href)) return "";
+    if (!SAFE_REPO_RE.test(repoName)) return "";
+    const clean = href.replace(/^\.?\//, "");
+    return safeHttpUrl(`https://github.com/${repoName}/blob/HEAD/${clean}`);
   }
 
   /* ---------- Actions ---------- */
@@ -930,19 +1346,17 @@
   function hideRepo(key) {
     state.hidden.add(key);
     saveLocalPrefs();
-    showToast("已隐藏该项目（可在右上角「RSS & 管理」恢复）");
+    showToast("已隐藏该项目（可在右上角「订阅 & 管理」恢复）");
   }
 
   function resetAllFilters() {
     state.category = "";
     state.language = "";
     state.search = "";
+    state.sort = "newest";
     state.multiOnly = false;
     state.hideRead = false;
-    els.searchInput.value = "";
-    els.langSelect.value = "";
-    els.btnMultiSource.setAttribute("aria-pressed", "false");
-    els.btnHideRead.setAttribute("aria-pressed", "false");
+    syncControlsFromState();
     saveLocalPrefs();
     renderCards();
   }
@@ -950,10 +1364,13 @@
   /* ---------- RSS & Management Modal ---------- */
   function openRssModal() {
     const feeds = [
-      { name: "全源聚合精选", rel: "./feeds/all_discoveries.xml" },
-      { name: "GitHub Trending（全语言精选）", rel: "./feeds/github_trending.xml" },
-      { name: "GitHub 定向雷达 & Release 追踪", rel: "./feeds/github_radar.xml" },
-      { name: "开源社区发现（Show HN / HelloGitHub / HuggingFace）", rel: "./feeds/community_picks.xml" },
+      { name: "全源聚合精选 (RSS 2.0)", rel: "./feeds/all_discoveries.xml" },
+      { name: "JSON Feed 1.1（现代阅读器 / 脚本）", rel: "./feeds/feed.json" },
+      { name: "GitHub Trending（全语言精选 RSS）", rel: "./feeds/github_trending.xml" },
+      { name: "GitHub 黑马雷达 & Release 追踪 (RSS)", rel: "./feeds/github_radar.xml" },
+      { name: "开源社区发现（Show HN / HelloGitHub / HF）", rel: "./feeds/community_picks.xml" },
+      { name: "OPML 全分榜一键导入包", rel: "./feeds/feeds.opml" },
+      { name: "AI Agent 直读入口 (/llms.txt)", rel: "./llms.txt" },
     ];
     els.rssList.innerHTML = feeds
       .map((f) => {
@@ -981,17 +1398,23 @@
   /* ---------- Daily Digest Modal ---------- */
   function buildMarkdownDigest(items, title) {
     const today = state.status.last_run_date || getLocalDateKey(new Date().toISOString());
+    const trendSummary = String(state.status.trend_summary || "").trim();
     const lines = [`# ${title} (${today})`, ""];
+    if (trendSummary) {
+      lines.push(`> 🧭 **今日风向标**：${trendSummary}`, "");
+    }
     items.forEach((it, idx) => {
       const tags = [];
       if ((it.sources || []).length >= 2) tags.push(`多源×${it.sources.length}`);
+      if (it.release_tag) tags.push(it.release_tag);
       if (it.category_tag) tags.push(it.category_tag);
       if (it.language) tags.push(it.language);
       let starPart = `★${(it.stars || 0).toLocaleString()}`;
       if ((it.stars_delta_24h || 0) > 0) starPart += ` (+${it.stars_delta_24h.toLocaleString()})`;
       tags.push(starPart);
+      const safeUrl = safeHttpUrl(it.url) || `https://github.com/${it.repo_name}`;
       const summary = it.ai_highlight || it.desc_cn || it.description || "";
-      lines.push(`${idx + 1}. **[${it.repo_name}](${it.url})** · ${tags.join(" · ")}`);
+      lines.push(`${idx + 1}. **[${it.repo_name}](${safeUrl})** · ${tags.join(" · ")}`);
       if (summary) lines.push(`   > ${summary}`);
     });
     return lines.join("\n");
@@ -1027,11 +1450,7 @@
       if (!btn) return;
       state.bucket = btn.dataset.bucket || "all";
       state.category = "";
-      els.bucketTabs.querySelectorAll(".tab-btn").forEach((b) => {
-        const active = b === btn;
-        b.classList.toggle("is-active", active);
-        b.setAttribute("aria-selected", String(active));
-      });
+      syncControlsFromState();
       renderCards();
     });
 
@@ -1071,14 +1490,15 @@
       renderCards();
     });
 
+    if (els.btnCopyFilterUrl) {
+      els.btnCopyFilterUrl.addEventListener("click", () => {
+        copyText(buildShareableUrl(), "已复制当前筛选视图深链");
+      });
+    }
+
     els.btnResetFilters.addEventListener("click", resetAllFilters);
     els.btnEmptyReset.addEventListener("click", () => {
       state.bucket = "all";
-      els.bucketTabs.querySelectorAll(".tab-btn").forEach((b) => {
-        const active = b.dataset.bucket === "all";
-        b.classList.toggle("is-active", active);
-        b.setAttribute("aria-selected", String(active));
-      });
       resetAllFilters();
     });
 
@@ -1140,7 +1560,7 @@
     els.rssList.addEventListener("click", (e) => {
       const btn = e.target.closest("[data-copy-url]");
       if (!btn) return;
-      copyText(btn.dataset.copyUrl, "已复制 RSS 订阅地址");
+      copyText(btn.dataset.copyUrl, "已复制订阅地址");
     });
 
     els.btnClearHidden.addEventListener("click", () => {
@@ -1167,7 +1587,11 @@
         return;
       }
       const md = buildMarkdownDigest(savedItems, "GitHub Radar 我的开源收藏");
-      downloadTextFile(`github-radar-saved-${getLocalDateKey(new Date().toISOString())}.md`, md, "text/markdown;charset=utf-8");
+      downloadTextFile(
+        `github-radar-saved-${getLocalDateKey(new Date().toISOString())}.md`,
+        md,
+        "text/markdown;charset=utf-8"
+      );
       showToast(`已导出 ${savedItems.length} 个收藏项目为 Markdown`);
     });
 
@@ -1225,8 +1649,18 @@
     });
     els.btnDownloadDigest.addEventListener("click", () => {
       const day = state.status.last_run_date || getLocalDateKey(new Date().toISOString());
-      downloadTextFile(`github-radar-digest-${day}.md`, els.digestTextarea.value, "text/markdown;charset=utf-8");
+      downloadTextFile(
+        `github-radar-digest-${day}.md`,
+        els.digestTextarea.value,
+        "text/markdown;charset=utf-8"
+      );
       showToast("已下载简报 Markdown 文件");
+    });
+
+    window.addEventListener("popstate", () => {
+      if (state.items.length > 0) {
+        applyUrlStateToView();
+      }
     });
 
     document.addEventListener("keydown", (e) => {
@@ -1272,7 +1706,10 @@
       const resp = await fetch(`./feeds/data.json?t=${Date.now()}`, { cache: "no-store" });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
-      state.items = Array.isArray(data.items) ? data.items : [];
+      state.items = (Array.isArray(data.items) ? data.items : []).map((it, idx) => ({
+        ...it,
+        _rank: idx,
+      }));
       state.status = data.status || {};
 
       const updated = formatFullTime(state.status.last_run_at || data.generated_at);
@@ -1280,8 +1717,8 @@
       const newBadge = newCount > 0 ? ` · 今日新增 ${newCount}` : "";
       els.issueMeta.textContent = `收录 ${state.items.length} 项${newBadge} · 更新于 ${updated || "刚刚"}`;
 
-      populateLanguages();
-      renderCards();
+      renderEditorialAndHealth();
+      applyUrlStateToView();
     } catch (err) {
       els.issueMeta.textContent = "数据加载失败";
       els.cardGrid.innerHTML = "";

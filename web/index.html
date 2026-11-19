@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>GitHub Radar · 每日开源精选画刊</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23171A16'/%3E%3Ccircle cx='32' cy='32' r='19' fill='none' stroke='%23E66A43' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='6' fill='%23E66A43'/%3E%3Cline x1='32' y1='32' x2='48' y2='18' stroke='%23FAFBF8' stroke-width='3.5' stroke-linecap='round'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="./styles.css?v=3" />
+  <link rel="alternate" type="application/rss+xml" title="GitHub Radar 全源精选 RSS" href="./feeds/all_discoveries.xml" />
+  <link rel="alternate" type="application/feed+json" title="GitHub Radar JSON Feed 1.1" href="./feeds/feed.json" />
+  <link rel="stylesheet" href="./styles.css?v=5" />
 </head>
 <body>
   <div class="page-shell">
@@ -19,15 +21,18 @@
         <p class="brand-sub">每日开源精选画刊 · 全源去噪、增速追踪与一句话导读</p>
       </div>
       <div class="masthead-right">
-        <div class="issue-meta" id="issueMeta">正在加载本期数据…</div>
+        <div class="issue-meta-group">
+          <div class="issue-meta" id="issueMeta">正在加载本期数据…</div>
+          <div class="source-health-pill" id="sourceHealthPill" hidden></div>
+        </div>
         <div class="masthead-actions">
           <button class="icon-pill" id="btnDigestModal" type="button" title="生成并复制今日精选 Markdown 简报">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
             <span>今日简报</span>
           </button>
-          <button class="icon-pill" id="btnRssModal" type="button" title="RSS 订阅与阅读数据管理">
+          <button class="icon-pill" id="btnRssModal" type="button" title="RSS / JSON Feed / Agent 订阅与阅读管理">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5" fill="currentColor" stroke="none"/></svg>
-            <span>RSS & 管理</span>
+            <span>订阅 & 管理</span>
           </button>
           <button class="icon-pill icon-only" id="btnTheme" type="button" title="切换深浅阅读模式 (快捷键 D)" aria-label="切换深浅阅读模式">
             <svg id="themeIconSun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32 1.41-1.41"/></svg>
@@ -36,6 +41,12 @@
         </div>
       </div>
     </header>
+
+    <!-- Editorial Issue Brief ("今日开源风向标") -->
+    <section class="editorial-brief" id="editorialBrief" aria-label="今日开源风向标" hidden>
+      <span class="brief-stamp">今日风向标</span>
+      <p class="brief-text" id="editorialBriefText"></p>
+    </section>
 
     <!-- Sticky Navigation & Filter Strip -->
     <nav class="control-strip" aria-label="栏目与筛选">
@@ -72,6 +83,7 @@
           <select id="sortSelect" class="select-ctrl" aria-label="排序方式">
             <option value="newest">最新发现</option>
             <option value="delta">24h 增速最快</option>
+            <option value="breakout">🚀 黑马爆发度</option>
             <option value="stars">Star 最多</option>
           </select>
 
@@ -91,7 +103,11 @@
     <!-- Active Filter Summary (shown only when filtered) -->
     <div class="filter-status" id="filterStatus" hidden>
       <span id="filterStatusText"></span>
-      <button type="button" class="text-link" id="btnResetFilters">清除全部筛选</button>
+      <div class="filter-status-actions">
+        <button type="button" class="text-link" id="btnCopyFilterUrl">复制当前筛选链接</button>
+        <span aria-hidden="true">·</span>
+        <button type="button" class="text-link" id="btnResetFilters">清除全部筛选</button>
+      </div>
     </div>
 
     <!-- Main Magazine Card Grid -->
@@ -105,9 +121,11 @@
     </main>
 
     <footer class="page-footer">
-      <span>每日自动采集去噪、增速追踪与 AI 导读</span>
+      <span>每日自动采集去噪、7d 轨迹追踪与 AI 导读</span>
       <span class="footer-dot">·</span>
       <span>点击卡片滑出详情抽屉 · 快捷键 <kbd>/</kbd> 搜索 <kbd>←</kbd><kbd>→</kbd> 翻篇 <kbd>S</kbd> 收藏 <kbd>D</kbd> 换肤</span>
+      <span class="footer-dot">·</span>
+      <a class="footer-link" href="./llms.txt" target="_blank" rel="noopener">/llms.txt</a>
     </footer>
   </div>
 
@@ -131,11 +149,11 @@
   <div class="modal-backdrop" id="rssBackdrop" hidden>
     <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="rssModalTitle">
       <div class="modal-head">
-        <h2 id="rssModalTitle">RSS 订阅与本地数据管理</h2>
+        <h2 id="rssModalTitle">RSS / JSON Feed / Agent 订阅与管理</h2>
         <button type="button" class="drawer-close" id="btnCloseRss" aria-label="关闭">✕</button>
       </div>
       <div class="modal-body">
-        <p class="modal-note">所有去噪分榜依然保留标准 RSS 2.0 静态地址，可直接添加到手机或桌面 RSS 客户端：</p>
+        <p class="modal-note">支持标准 RSS 2.0 分榜、JSON Feed 1.1、OPML 一键导入及 AI Agent 直读接口：</p>
         <div class="rss-list" id="rssList"></div>
 
         <hr class="modal-divider" />
@@ -188,6 +206,6 @@
   <!-- Toast -->
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
-  <script src="./app.js?v=3" defer></script>
+  <script src="./app.js?v=5" defer></script>
 </body>
 </html>

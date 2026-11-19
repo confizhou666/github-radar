@@ -10,6 +10,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  models: read
 
 concurrency:
   group: "pages"
@@ -24,6 +25,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+        continue-on-error: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -44,6 +50,7 @@ jobs:
       - name: Run GitHub Radar pipeline
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RADAR_PUBLIC_BASE_URL: ${{ steps.pages.outputs.base_url }}
           RADAR_AI_API_KEY: ${{ secrets.RADAR_AI_API_KEY }}
           RADAR_AI_BASE_URL: ${{ secrets.RADAR_AI_BASE_URL }}
           RADAR_AI_MODEL: ${{ secrets.RADAR_AI_MODEL }}
@@ -57,9 +64,8 @@ jobs:
           mkdir -p _site/feeds
           cp -r web/* _site/
           cp -r feeds/* _site/feeds/
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
+          cp -f feeds/llms.txt _site/llms.txt
+          cp -f feeds/feeds.opml _site/feeds.opml
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

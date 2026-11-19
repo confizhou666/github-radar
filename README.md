@@ -20,13 +20,13 @@
   - 支持 `whitelist_repos`（特例放行）、`blacklist_owners`（屏蔽营销号/高频刷榜账号）、`min_stars` 与可配置关键词黑名单（拦截 `awesome-*` 合集、八股面试、毕设模板、引流卖课与灰产脚本）。
 - **SQLite 增量缓存与 Star 增速追踪**：
   - `data/radar.db` 兼容旧库平滑迁移，通过 `repo_snapshots` 每日快照自动计算 `stars_delta_24h` 与 `stars_delta_7d`，精准捕捉突然飙升的黑马项目。
-- **免费中文翻译 + 通用大模型 API / `agy` 双引擎**：
-  - 内置免费 Google `gtx` + MyMemory 翻译兜底，自动跳过已是中文的项目。
-  - AI 一句话导读与语义去噪支持标准 **OpenAI 兼容接口**（DeepSeek / OpenAI / Gemini / Ollama，纯标准库零额外依赖）与本地 `agy` CLI；未配置密钥时自动降级。
-- **Web 画刊、RSS 2.0 与消息推送**：
-  - **Web 画刊**：零构建纯静态前端，支持按发现日期时间轴分组、`多源共振` 筛选、`24h 增速最快` 排序、主题胶囊与语言搜索、滑出式详情抽屉（含 `Topics`、开源协议、Issues、最近提交、在线 README 预览、一键 `git clone`）、`今日简报` Markdown 弹窗、收藏夹导出 Markdown 以及本地阅读记录 JSON 导入/导出备份。
-  - **RSS 2.0**：输出全源聚合及 3 个互不重复分榜 XML（`all_discoveries.xml`、`github_trending.xml`、`github_radar.xml`、`community_picks.xml`）及 `feeds.opml`，订阅地址自动适配 GitHub Pages 子路径。
-  - **消息推送**：支持通用 Webhook、飞书交互卡片、钉钉、企业微信、Discord、Telegram 每日简报推送（支持 `--notify-dry-run` 终端预览）。
+- **免费中文翻译 + GitHub Models / 通用大模型 / `agy` 三引擎**：
+  - 内置免费 Google `gtx` + MyMemory 多线程并发翻译，统一支持 `network.proxy` / `RADAR_PROXY` 代理，自动跳过已是中文的项目。
+  - AI 分块全量导读、存量无标回填与「今日开源风向标」支持 **GitHub Models 免费大模型**（Fork 后直接复用内置 `GITHUB_TOKEN`，零密钥开箱即用）、标准 **OpenAI 兼容接口**（DeepSeek / OpenAI / Gemini / Ollama）与本地 `agy` CLI。
+- **Web 画刊、RSS 2.0、JSON Feed 1.1 与 AI Agent 生态**：
+  - **Web 画刊**：零构建纯静态前端，含刊首「今日风向标」、信源健康度监控、分类防霸榜配额（`max_category_share`）、7 日原生 SVG 迷你趋势图（Sparkline）、`🚀 黑马爆发度` 排序、URL 状态深链分享、详情抽屉（含 GitHub OpenGraph 预览卡、零限流 CDN README 预览、一键 `git clone`）及本地阅读备份。
+  - **多制式订阅与 Agent 直读**：同时输出 4 份标准 RSS 2.0 分榜 XML、动态 `feeds.opml`、**JSON Feed 1.1 (`feeds/feed.json`)**、站点根目录 **`/llms.txt`**，并内置零后端 [`skills/github-radar/SKILL.md`](skills/github-radar/SKILL.md) 供 Claude Code / Cursor / Antigravity 直接查询。
+  - **消息推送**：支持通用 Webhook、飞书交互卡片、钉钉、企业微信（4096 字节自动分片）、Discord（2000 字符自动分片）、Telegram（HTML 安全转义模式）每日简报推送。
 
 ---
 
@@ -49,22 +49,25 @@
 ## 工作流程
 
 ```text
-多源采集 (Trending / Search / Starred / Show HN / HelloGitHub / HF Papers / Releases / Reddit & RSS)
+多源并发采集 (Trending / Search / Starred / Show HN / HelloGitHub / HF Papers / Releases / Reddit & RSS)
    │
    ▼
-GitHub 元信息补充 (enrich_github_metadata，支持 GITHUB_TOKEN 与未认证配额保护)
+跨源合并去重 + 本地零成本黑白名单预筛 (merge_raw_items + prefilter_merged_items)
    │
    ▼
-跨源合并去重 + 白名单 / 作者黑名单 / 关键词 / 反刷星过滤 (radar/filters.py)
+GitHub 元信息批量补充 (GraphQL v4 50仓/批 + REST 容错回退，补全 0★ / 语言 / Topics / 创仓时间)
    │
    ▼
-SQLite 增量比对 & 每日 Star 快照 (data/radar.db) ──► 计算 24h / 7d 增速
+完整反刷星与结构去噪过滤 (拦截 ~383★ 盗版安装器壳仓 · 词边界防误伤 · Releases 年龄豁免)
    │
    ▼
-仅对新仓库执行中文翻译 & 批量 AI 亮点提炼 (OpenAI 兼容 API / agy CLI)
+SQLite 增量比对 & 每日 Star 快照 (data/radar.db) ──► 计算 24h / 7d 增速 + 非活跃增速衰减清零
    │
    ▼
-生成 feeds/data.json + 4 份 RSS 2.0 XML ──► GitHub Pages / Nginx 画刊 + Webhook 简报推送
+多线程并发中文翻译 & 分块 AI 全量导读 + 存量回填 (OpenAI 兼容 / GitHub Models / agy CLI)
+   │
+   ▼
+分类防霸榜配额 ──► 生成 data.json + feed.json + 4 路 RSS + feeds.opml + llms.txt + 状态压缩备份 + 分片通知
 ```
 
 ---
@@ -74,28 +77,30 @@ SQLite 增量比对 & 每日 Star 快照 (data/radar.db) ──► 计算 24h / 
 ```text
 github-radar/
 ├── .github/workflows/
-│   └── radar.yml           # GitHub Actions 定时采集与 GitHub Pages 自动部署
-├── run.py                  # CLI 入口（--no-ai / --export-only / --notify-dry-run / --no-notify）
-├── config.yaml             # 网络代理、数据源、黑白名单、翻译、AI 引擎与推送配置
+│   └── radar.yml           # GitHub Actions 定时采集（含 models:read 与双重状态持久化）与 Pages 部署
+├── skills/github-radar/
+│   └── SKILL.md            # 零后端 AI Agent Skill（直接读取线上 Pages JSON / llms.txt）
+├── run.py                  # CLI 入口（--no-ai / --export-only / --restore-state / --notify-dry-run / --no-notify）
+├── config.yaml             # 网络代理、数据源、黑白名单、翻译、AI 引擎、分类配额与推送配置
 ├── requirements.txt        # Python 依赖（PyYAML>=6.0）
 ├── docker-compose.yml      # Nginx 静态画刊与 Feeds 服务编排
-├── nginx.conf              # Nginx 站点与 /feeds/ 跨域、缓存配置
-├── feeds.opml              # RSS 分榜 OPML 导入模板（可按需替换服务地址）
+├── nginx.conf              # Nginx 站点、/llms.txt、/feeds.opml 与 /feeds/ 跨域缓存配置
+├── feeds.opml              # RSS 分榜 OPML 导入模板（流水线同时动态生成 feeds/feeds.opml）
 ├── radar/
 │   ├── config.py           # YAML 配置加载
 │   ├── models.py           # RepoItem 数据模型
-│   ├── sources.py          # 多源抓取与 GitHub 元信息补充
-│   ├── filters.py          # 跨源去重与黑白名单去噪
-│   ├── translator.py       # 免费中文翻译与双引擎 AI 亮点生成
-│   ├── feed_builder.py     # RSS 2.0 XML 与 Web data.json 生成
-│   ├── notifier.py         # 飞书 / 钉钉 / 企微 / Discord / Telegram / 通用 Webhook 推送
-│   └── pipeline.py         # SQLite 持久化、快照增速计算与主流水线编排
+│   ├── sources.py          # 多线程多源抓取、信源健康度与 GraphQL/REST 元信息补全
+│   ├── filters.py          # 跨源去重、词边界黑白名单、反刷星与黑马爆发度计算
+│   ├── translator.py       # 并发中文翻译、三引擎分块 AI 导读与「今日开源风向标」
+│   ├── feed_builder.py     # 分类防霸榜配额、RSS 2.0、JSON Feed 1.1、OPML、llms.txt 与 data.json
+│   ├── notifier.py         # 飞书 / 钉钉 / 企微 / Discord / Telegram(HTML) 按字节安全分片推送
+│   └── pipeline.py         # SQLite 持久化、增速衰减、存量回填、状态备份恢复与主流水线编排
 ├── web/
-│   ├── index.html          # 画刊页面结构
-│   ├── styles.css          # 浅色/深色主题、时间轴与弹窗样式
-│   └── app.js              # 筛选、抽屉、README 预览、简报生成、备份恢复与快捷键
+│   ├── index.html          # 画刊页面结构（含今日风向标、信源健康度、黑马排序）
+│   ├── styles.css          # 浅色/深色主题、Sparkline、OpenGraph 预览卡与响应式样式
+│   └── app.js              # 筛选、URL 深链同步、抽屉、零限流 CDN README 预览与阅读备份
 └── tests/
-    └── test_radar.py       # 解析、去噪、迁移快照、OpenAI 兼容接口与推送单元测试
+    └── test_radar.py       # 反刷星、词边界、GraphQL、AI 分块回填、增速衰减、分片通知与状态恢复测试
 ```
 
 ---
@@ -105,13 +110,14 @@ github-radar/
 仓库已自带 [.github/workflows/radar.yml](.github/workflows/radar.yml)，Fork 本仓库即可零成本托管：
 
 1. 进入仓库 **Settings → Pages**，将 **Source** 设置为 **GitHub Actions**。
-2. 按需在 **Settings → Secrets and variables → Actions** 中添加环境变量（全部可选）：
-   - `RADAR_AI_API_KEY`：OpenAI 兼容大模型 API Key（不填则自动跳过 AI 导读，保留免费中文翻译）
+2. 工作流默认已声明 `models: read` 权限，**无需配置任何 API Key** 即可通过内置 `GITHUB_TOKEN` 自动调用 **GitHub Models (`openai/gpt-4o-mini`)** 生成中文亮点与今日风向标，并通过 GitHub GraphQL 批量补全仓库元信息；同时随 `_site` 自动备份压缩状态快照，防止 Actions Cache 过期导致重复推送。
+3. 如需自定义外部模型或消息通知，可在 **Settings → Secrets and variables → Actions** 中添加可选变量：
+   - `RADAR_AI_API_KEY`：自定义 OpenAI 兼容大模型 API Key（配置后优先于 GitHub Models）
    - `RADAR_AI_BASE_URL`：接口地址（如 DeepSeek、SiliconFlow 或自建网关，默认 `https://api.openai.com/v1`）
-   - `RADAR_AI_MODEL`：模型名（默认 `gpt-4o-mini`）
+   - `RADAR_AI_MODEL`：模型名（默认 `gpt-4o-mini` / GitHub Models 自动映射 `openai/gpt-4o-mini`）
    - `RADAR_WEBHOOK_URL`：开启 `notifications.enabled: true` 后用于接收飞书 / 钉钉 / 企微 / Discord 简报
    - `RADAR_TG_BOT_TOKEN` / `RADAR_TG_CHAT_ID`：Telegram 机器人推送配置
-3. 进入 **Actions → GitHub Radar Daily Build & Pages → Run workflow** 手动触发首次构建；之后每天北京时间 `03:30` 自动采集更新并发布站点与 RSS。
+4. 进入 **Actions → GitHub Radar Daily Build & Pages → Run workflow** 手动触发首次构建；之后每天北京时间 `03:30` 自动采集更新并发布画刊、RSS、`feed.json` 与 `/llms.txt`。
 
 ---
 
@@ -154,9 +160,9 @@ docker compose up -d
 | `sources.reddit_rss` / `extra_rss_urls` | Subreddit 订阅（支持配置 `rss_base_url` 为自建 RSSHub）与任意自定义 RSS/Atom |
 | `filters` | 配置 `whitelist_repos`、`blacklist_owners`、`min_stars`、`anti_star_farm` 与关键词黑名单 |
 | `translation` | 启用/禁用免费中文翻译（默认 `google_gtx` + MyMemory 备用） |
-| `ai_highlight` | 支持 `provider: auto \| openai \| agy`、兼容接口 `base_url`/`openai_model` 与 `agy` 路径 |
-| `notifications` | 配置推送开关、`provider`（`generic`/`feishu`/`dingtalk`/`wecom`/`discord`/`telegram`）与筛选条件 |
-| `output` | 控制 RSS/Web 最大展示条数及 RSS `<link>` 使用的 `public_base_url` |
+| `ai_highlight` | 支持 `provider: auto \| openai \| github_models \| agy`、分块导读、存量回填与 `base_url`/`openai_model` |
+| `notifications` | 配置推送开关、`provider`（`generic`/`feishu`/`dingtalk`/`wecom`/`discord`/`telegram`）、分类配额与自动分片 |
+| `output` | 控制 RSS/Web 最大展示条数、`max_category_share` 防霸榜配额及 `public_base_url` |
 
 ---
 

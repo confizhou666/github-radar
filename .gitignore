@@ -1,6 +1,7 @@
 # Runtime generated data & feeds
 data/
 feeds/
+web/llms.txt
 *.db
 *.sqlite
 *.sqlite3

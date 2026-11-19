@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -12,23 +13,33 @@ import urllib.error
 import xml.etree.ElementTree as ET
 
 from radar.config import RadarConfig
-from radar.filters import deduplicate_and_filter, is_noisy_repo
+from radar.feed_builder import apply_category_quota, normalize_macro_category, resolve_site_and_feeds_urls
+from radar.filters import compute_breakout_score, deduplicate_and_filter, is_noisy_repo
 from radar.models import RepoItem
-from radar.notifier import build_digest_markdown, build_webhook_payload, filter_digest_items
-from radar.pipeline import RadarStore, export_only, run_pipeline
+from radar.notifier import (
+    build_digest_markdown,
+    build_webhook_payload,
+    build_webhook_payloads,
+    filter_digest_items,
+)
+from radar.pipeline import RadarStore, export_only, restore_state_from_source, run_pipeline
 from radar.sources import (
+    collect_all_sources,
+    enrich_github_metadata,
+    extract_github_repo_from_url,
+    fetch_hackernews_show,
     parse_github_releases_atom,
     parse_github_trending_html,
     parse_huggingface_papers_json,
 )
-from radar.translator import generate_ai_highlights
+from radar.translator import GITHUB_MODELS_ENDPOINT, generate_ai_highlights
 
 
 class _FakeHTTPResp:
-    def __init__(self, body: str, status: int = 200):
-        self._body = body.encode("utf-8")
+    def __init__(self, body: str | bytes, status: int = 200, headers: dict | None = None):
+        self._body = body.encode("utf-8") if isinstance(body, str) else body
         self.status = status
-        self.headers = {}
+        self.headers = headers or {}
 
     def read(self) -> bytes:
         return self._body
@@ -130,6 +141,118 @@ class TestGitHubRadar(unittest.TestCase):
         drop, reason = is_noisy_repo(good, filters, now_utc=now)
         self.assertFalse(drop, f"Unexpected drop for valid repo: {reason}")
 
+    def test_star_farm_shells_topics_and_word_boundary_safety(self) -> None:
+        """P0-1 & P0-5: Catch ~383-star poisoned shells without harming firecracker / GC / virtual-list / k8s."""
+        cfg = self._cfg()
+        now = datetime(2026, 11, 19, tzinfo=timezone.utc)
+        recent = (now - timedelta(days=4)).isoformat()
+
+        poison_shells = [
+            RepoItem(
+                repo_name="nabilaolivia/adobe-indesign-deployment-pipeline",
+                url="https://github.com/nabilaolivia/adobe-indesign-deployment-pipeline",
+                description="Adobe InDesign Desktop Build: Secure Digital Asset Deployment Pipeline",
+                language="HTML",
+                stars=384,
+                forks=1,
+                topics=["adobe-indesign", "indesign-free-soft"],
+                created_at=recent,
+            ),
+            RepoItem(
+                repo_name="tiototo/cinebench-2026-desktop-setup",
+                url="https://github.com/tiototo/cinebench-2026-desktop-setup",
+                description="Cinebench 2026 Standalone Desktop Setup with Pre-Configured Components",
+                language="HTML",
+                stars=383,
+                forks=0,
+                topics=["cinebench", "cinebench-crack"],
+                created_at=recent,
+            ),
+            RepoItem(
+                repo_name="abhi/ai-app-builder-open",
+                url="https://github.com/abhi/ai-app-builder-open",
+                description="Open-source AI app builder for full-stack Next.js apps with hosting",
+                language="HTML",
+                stars=384,
+                forks=0,
+                created_at=recent,
+            ),
+            RepoItem(
+                repo_name="sketch/daemon-pro-installer",
+                url="https://github.com/sketch/daemon-pro-installer",
+                description="DAEMON-Pro: Full-Feature Security Installer for Desktop Deployment",
+                language="TypeScript",
+                stars=140,
+                forks=1,
+                created_at=recent,
+            ),
+            RepoItem(
+                repo_name="eng/phantom-blade-zero-runtime-toolkit",
+                url="https://github.com/eng/phantom-blade-zero-runtime-toolkit",
+                description="PhantomBladeZero-Cheat: 54 toggleable runtime options",
+                language="HTML",
+                stars=382,
+                forks=0,
+                topics=["phantom-blade-zero-trainer"],
+                created_at=recent,
+            ),
+        ]
+        for shell in poison_shells:
+            drop, reason = is_noisy_repo(shell, cfg.filters, now_utc=now)
+            self.assertTrue(drop, f"Poisoned shell {shell.repo_name} escaped filter!")
+            self.assertNotEqual(reason, "ok")
+
+        legit_hardcore_repos = [
+            RepoItem(
+                repo_name="firecracker-microvm/firecracker",
+                url="https://github.com/firecracker-microvm/firecracker",
+                description="Secure and fast microVMs for serverless computing",
+                language="Rust",
+                stars=26000,
+                forks=1850,
+                created_at=(now - timedelta(days=400)).isoformat(),
+            ),
+            RepoItem(
+                repo_name="runtime/mmtk-core",
+                url="https://github.com/runtime/mmtk-core",
+                description="High-performance concurrent garbage collection framework in Rust",
+                language="Rust",
+                stars=980,
+                forks=110,
+                created_at=(now - timedelta(days=300)).isoformat(),
+            ),
+            RepoItem(
+                repo_name="ui/solid-virtual-list",
+                url="https://github.com/ui/solid-virtual-list",
+                description="Zero-dependency virtual-list renderer for 100k DOM rows",
+                language="TypeScript",
+                stars=340,
+                forks=19,
+                created_at=(now - timedelta(days=60)).isoformat(),
+            ),
+            RepoItem(
+                repo_name="ops/kube-warden",
+                url="https://github.com/ops/kube-warden",
+                description="Reconcile and audit kubernetes resources with eBPF policies",
+                language="Go",
+                stars=620,
+                forks=48,
+                created_at=(now - timedelta(days=90)).isoformat(),
+            ),
+            RepoItem(
+                repo_name="ets-labs/python-dependency-injector",
+                url="https://github.com/ets-labs/python-dependency-injector",
+                description="Dependency injector framework and IoC container for Python",
+                language="Python",
+                stars=4100,
+                forks=430,
+                created_at=(now - timedelta(days=500)).isoformat(),
+            ),
+        ]
+        for good in legit_hardcore_repos:
+            drop, reason = is_noisy_repo(good, cfg.filters, now_utc=now)
+            self.assertFalse(drop, f"False positive on {good.repo_name}: {reason}")
+
     def test_dedup_pipeline_translation_ai_and_feeds(self) -> None:
         cfg = self._cfg()
         with tempfile.TemporaryDirectory() as tmp:
@@ -207,6 +330,7 @@ class TestGitHubRadar(unittest.TestCase):
             self.assertEqual(stats["unique_count"], 2)
             self.assertEqual(stats["new_count"], 1)
             self.assertEqual(stats["dropped_count"], 1)
+            self.assertTrue(stats["trend_summary"])
 
             all_xml = (base / "feeds" / "all_discoveries.xml").read_text(encoding="utf-8")
             root = ET.fromstring(all_xml)
@@ -230,6 +354,13 @@ class TestGitHubRadar(unittest.TestCase):
             self.assertEqual(item0["license_name"], "MIT")
             self.assertEqual(item0["topics"], ["rust", "audio", "synth"])
             self.assertTrue(item0["multi_source"])
+            self.assertEqual(item0["sparkline"], [265, 350])
+
+            # JSON Feed 1.1, dynamic OPML, llms.txt & compressed state backup all emitted
+            self.assertTrue((base / "feeds" / "feed.json").exists())
+            self.assertTrue((base / "feeds" / "feeds.opml").exists())
+            self.assertTrue((base / "feeds" / "llms.txt").exists())
+            self.assertTrue((base / "feeds" / "state_backup.json.gz").exists())
 
             (base / "feeds" / "data.json").unlink()
             exp_stats = export_only(cfg, base)
@@ -270,6 +401,7 @@ class TestGitHubRadar(unittest.TestCase):
         self.assertEqual(len(hf_items), 1)
         self.assertEqual(hf_items[0].repo_name, "lab/sparse-attn")
         self.assertEqual(hf_items[0].stars, 180)
+        self.assertEqual(hf_items[0].community_score, 42)
         self.assertEqual(hf_items[0].discussion_url, "https://huggingface.co/papers/2611.01234")
 
         atom_xml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -288,6 +420,352 @@ class TestGitHubRadar(unittest.TestCase):
         self.assertEqual(rel_item.release_tag, "0.13.9")
         self.assertIn("Faster resolver", rel_item.description)
         self.assertEqual(rel_item.sources, ["GitHub Releases"])
+
+    def test_graphql_batch_rest_404_resilience_and_community_exemption(self) -> None:
+        """P0-2 & P1-3: HN points separated from stars, GraphQL batch enrich, REST skips 404 without aborting, community fallback."""
+        hn_payload = json.dumps(
+            {
+                "hits": [
+                    {
+                        "title": "Show HN: Zero-copy Parquet viewer",
+                        "url": "https://github.com/indie/pq-view",
+                        "points": 168,
+                        "objectID": "42001",
+                    }
+                ]
+            }
+        )
+        with patch("urllib.request.urlopen", return_value=_FakeHTTPResp(hn_payload)):
+            hn_items = fetch_hackernews_show({"enabled": True, "limit": 10})
+        self.assertEqual(len(hn_items), 1)
+        self.assertEqual(hn_items[0].stars, 0)
+        self.assertEqual(hn_items[0].community_score, 168)
+
+        # GraphQL batch enrichment overwrites 0-star HelloGitHub & Show HN with real stargazerCount
+        batch_items = [
+            RepoItem(repo_name="hg/zero-star-item", url="https://github.com/hg/zero-star-item", description="HG desc", language="C#", stars=0, sources=["HelloGitHub"]),
+            hn_items[0],
+        ]
+        gql_resp = {
+            "data": {
+                "r0": {
+                    "nameWithOwner": "hg/zero-star-item",
+                    "description": "HG desc",
+                    "stargazerCount": 2450,
+                    "forkCount": 190,
+                    "createdAt": "2025-05-01T00:00:00Z",
+                    "pushedAt": "2026-11-18T00:00:00Z",
+                    "primaryLanguage": {"name": "C#"},
+                    "licenseInfo": {"spdxId": "MIT"},
+                    "issues": {"totalCount": 12},
+                    "repositoryTopics": {"nodes": [{"topic": {"name": "converter"}}]},
+                },
+                "r1": {
+                    "nameWithOwner": "indie/pq-view",
+                    "description": "Zero-copy Parquet viewer",
+                    "stargazerCount": 530,
+                    "forkCount": 31,
+                    "createdAt": "2026-11-10T00:00:00Z",
+                    "pushedAt": "2026-11-19T00:00:00Z",
+                    "primaryLanguage": {"name": "Rust"},
+                    "licenseInfo": {"spdxId": "Apache-2.0"},
+                    "issues": {"totalCount": 3},
+                    "repositoryTopics": {"nodes": []},
+                },
+            }
+        }
+        with patch("urllib.request.urlopen", return_value=_FakeHTTPResp(json.dumps(gql_resp))) as mock_open:
+            enriched_n = enrich_github_metadata(batch_items, github_token="ghs_dummy_token")
+        self.assertEqual(mock_open.call_count, 1)
+        self.assertEqual(enriched_n, 2)
+        self.assertEqual(batch_items[0].stars, 2450)
+        self.assertEqual(batch_items[1].stars, 530)
+        self.assertEqual(batch_items[1].language, "Rust")
+
+        # REST mode without token: 404 on first item MUST NOT abort second item; 429 on third stops cleanly
+        rest_items = [
+            RepoItem(repo_name="dead/deleted-repo", url="u", description="Dead repo", sources=["Show HN"]),
+            RepoItem(repo_name="live/good-repo", url="u", description="Good repo", sources=["Show HN"]),
+            RepoItem(repo_name="quota/unreached-repo", url="u", description="Valid community tool", sources=["HuggingFace Papers"]),
+        ]
+
+        def fake_rest_urlopen(req, timeout=12):
+            if "dead/deleted-repo" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b"{}"))
+            if "live/good-repo" in req.full_url:
+                return _FakeHTTPResp(
+                    json.dumps(
+                        {
+                            "full_name": "live/good-repo",
+                            "stargazers_count": 310,
+                            "forks_count": 22,
+                            "language": "Go",
+                            "created_at": "2026-10-01T00:00:00Z",
+                        }
+                    ),
+                    headers={"x-ratelimit-remaining": "10"},
+                )
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, io.BytesIO(b"{}"))
+
+        with patch("urllib.request.urlopen", side_effect=fake_rest_urlopen):
+            enrich_github_metadata(rest_items, github_token="")
+
+        self.assertEqual(rest_items[1].stars, 310)
+        self.assertEqual(rest_items[1].language, "Go")
+        self.assertFalse(rest_items[2].metadata_enriched)
+        self.assertIsNone(rest_items[2].language)
+
+        # Un-enriched curated community source is exempted from require_programming_language
+        cfg = self._cfg()
+        drop_unreached, _ = is_noisy_repo(rest_items[2], cfg.filters)
+        self.assertFalse(drop_unreached)
+
+        # Source health collection
+        health: dict = {}
+        with patch("urllib.request.urlopen", return_value=_FakeHTTPResp(hn_payload)):
+            collected = collect_all_sources(
+                {
+                    "github_trending": {"enabled": False},
+                    "github_search": {"enabled": False},
+                    "hackernews_show": {"enabled": True, "limit": 5},
+                    "hellogithub": {"enabled": False},
+                    "huggingface_papers": {"enabled": False},
+                    "github_releases": {"enabled": False},
+                    "reddit_rss": {"enabled": False},
+                },
+                {},
+                health_out=health,
+            )
+        self.assertEqual(len(collected), 1)
+        self.assertTrue(health["hackernews_show"]["ok"])
+        self.assertEqual(health["hackernews_show"]["count"], 1)
+
+    def test_ai_chunking_backfill_and_github_models_auto_provider(self) -> None:
+        """P0-3 & P1-1: Chunked AI batches (> max_batch_items), DB backfill, and GitHub Models free endpoint."""
+        five_items = [
+            RepoItem(
+                repo_name=f"org/tool-{i}",
+                url=f"https://github.com/org/tool-{i}",
+                description=f"Developer utility number {i}",
+                language="Rust",
+                stars=100 + i * 20,
+                forks=15,
+            )
+            for i in range(5)
+        ]
+        chunk_calls = []
+
+        def fake_chunk_runner(prompt: str) -> str:
+            chunk_calls.append(prompt)
+            out_items = []
+            for r in five_items:
+                if r.repo_name in prompt:
+                    out_items.append(
+                        {
+                            "repo_name": r.repo_name,
+                            "keep": True,
+                            "category_tag": "效率工具",
+                            "highlight": f"{r.repo_name} 的亮点描述。",
+                        }
+                    )
+            return json.dumps(
+                {
+                    "trend_summary": "Rust 命令行与底层工具持续走热，org/tool-4 表现突出。",
+                    "items": out_items,
+                },
+                ensure_ascii=False,
+            )
+
+        summary_box: list[str] = []
+        res = generate_ai_highlights(
+            five_items,
+            {"enabled": True, "max_batch_items": 2, "max_chunks_per_run": 5},
+            runner=fake_chunk_runner,
+            trend_summary_out=summary_box,
+        )
+        self.assertEqual(len(chunk_calls), 3)
+        self.assertEqual(len(res), 5)
+        self.assertEqual(summary_box[0], "Rust 命令行与底层工具持续走热，org/tool-4 表现突出。")
+
+        # GitHub Models auto-detection when RADAR_AI_API_KEY is empty and GITHUB_TOKEN is provided
+        captured_reqs = []
+
+        def fake_gh_models_open(req, timeout=60):
+            captured_reqs.append((req.full_url, dict(req.header_items()), json.loads(req.data.decode("utf-8"))))
+            resp_body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "items": [
+                                        {
+                                            "repo_name": "org/tool-0",
+                                            "keep": True,
+                                            "category_tag": "系统底层",
+                                            "highlight": "零密钥 GitHub Models 自动导读成功。",
+                                        }
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+            return _FakeHTTPResp(json.dumps(resp_body, ensure_ascii=False))
+
+        with patch.dict(os.environ, {"RADAR_AI_API_KEY": "", "OPENAI_API_KEY": ""}, clear=False):
+            with patch("urllib.request.urlopen", side_effect=fake_gh_models_open):
+                gh_res = generate_ai_highlights(
+                    five_items[:1],
+                    {
+                        "enabled": True,
+                        "provider": "auto",
+                        "openai_model": "gpt-4o-mini",
+                        "use_github_models": True,
+                        "github_models_batch_items": 8,
+                    },
+                    github_token="ghs_actions_token",
+                )
+        self.assertEqual(len(captured_reqs), 1)
+        self.assertEqual(captured_reqs[0][0], GITHUB_MODELS_ENDPOINT)
+        self.assertEqual(captured_reqs[0][2]["model"], "openai/gpt-4o-mini")
+        self.assertEqual(gh_res["org/tool-0"]["category_tag"], "系统底层")
+
+        # Pipeline backfill: unhighlighted items from earlier run get highlighted on subsequent run
+        cfg = self._cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            run_pipeline(
+                cfg,
+                base,
+                raw_items_override=five_items[:2],
+                translate_fn=lambda s: s,
+                enable_ai=False,
+                skip_enrich=True,
+                enable_notify=False,
+            )
+            data1 = json.loads((base / "feeds" / "data.json").read_text(encoding="utf-8"))
+            self.assertEqual(data1["items"][0]["ai_highlight"], "")
+
+            run_pipeline(
+                cfg,
+                base,
+                raw_items_override=five_items[2:3],
+                translate_fn=lambda s: s,
+                ai_runner=fake_chunk_runner,
+                enable_ai=True,
+                skip_enrich=True,
+                enable_notify=False,
+            )
+            data2 = json.loads((base / "feeds" / "data.json").read_text(encoding="utf-8"))
+            by_key = {it["key"]: it for it in data2["items"]}
+            self.assertIn("org/tool-0 的亮点描述", by_key["org/tool-0"]["ai_highlight"])
+            self.assertIn("org/tool-2 的亮点描述", by_key["org/tool-2"]["ai_highlight"])
+
+    def test_delta_decay_union_sources_and_release_guid_refresh(self) -> None:
+        """P0-4: Stale 24h deltas decay to 0, sources union-merge across days, and old Releases refresh GUID."""
+        cfg = self._cfg()
+        now = datetime(2026, 11, 19, tzinfo=timezone.utc)
+
+        # 8-year-old repo on GitHub Releases is exempted from max_repo_age_years=5
+        old_release = RepoItem(
+            repo_name="ollama/ancient-engine",
+            url="https://github.com/ollama/ancient-engine",
+            description="[Release v2.0.0] Major release notes",
+            language="Go",
+            stars=45000,
+            forks=3200,
+            created_at=(now - timedelta(days=365 * 8)).isoformat(),
+            sources=["GitHub Releases"],
+            release_tag="v2.0.0",
+        )
+        drop_rel, _ = is_noisy_repo(old_release, cfg.filters, now_utc=now)
+        self.assertFalse(drop_rel)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "radar.db"
+            store = RadarStore(db_path)
+            try:
+                # Day 1: spike_repo has +1200 delta; cross_repo seen on Show HN
+                spike = RepoItem(
+                    repo_name="spike/yesterday-hit",
+                    url="https://github.com/spike/yesterday-hit",
+                    description="Yesterday hit",
+                    language="Python",
+                    stars=2000,
+                    forks=120,
+                    stars_delta_24h=1200,
+                    sources=["GitHub Trending"],
+                    discovered_at="2026-11-17T08:00:00+00:00",
+                )
+                cross = RepoItem(
+                    repo_name="cross/multi-gem",
+                    url="https://github.com/cross/multi-gem",
+                    description="Cross source gem",
+                    language="Rust",
+                    stars=300,
+                    forks=24,
+                    sources=["Show HN"],
+                    discovered_at="2026-11-19T08:00:00+00:00",
+                )
+                store.upsert_repo(spike, kept=True, seen_date="2026-11-17")
+                store.upsert_repo(cross, kept=True, seen_date="2026-11-18")
+                store.upsert_repo(old_release, kept=True, seen_date="2026-11-18")
+
+                # Day 2 (2026-11-19): cross_repo also hits GitHub Trending; spike_repo not seen today
+                cross_day2 = RepoItem(
+                    repo_name="cross/multi-gem",
+                    url="https://github.com/cross/multi-gem",
+                    description="Cross source gem",
+                    language="Rust",
+                    stars=480,
+                    forks=35,
+                    stars_delta_24h=180,
+                    sources=["GitHub Trending"],
+                    discovered_at="2026-11-19T09:00:00+00:00",
+                )
+                store.upsert_repo(cross_day2, kept=True, seen_date="2026-11-19")
+                store.decay_stale_deltas("2026-11-19")
+
+                loaded = {r.canonical_key: r for r in store.load_recent_kept(limit=20)}
+                self.assertEqual(loaded["spike/yesterday-hit"].stars_delta_24h, 0)
+                self.assertEqual(loaded["cross/multi-gem"].sources, ["Show HN", "GitHub Trending"])
+                self.assertEqual(loaded["cross/multi-gem"].stars_delta_24h, 180)
+            finally:
+                store.close()
+
+            # Verify release_tag update refreshes GUID in pipeline
+            base = Path(tmp) / "pipe"
+            rel_v1 = RepoItem(
+                repo_name="astral-sh/uv",
+                url="https://github.com/astral-sh/uv",
+                description="[Release 0.13.8] Fast wheel cache",
+                language="Rust",
+                stars=50000,
+                forks=1500,
+                sources=["GitHub Releases"],
+                release_tag="0.13.8",
+            )
+            run_pipeline(cfg, base, raw_items_override=[rel_v1], translate_fn=lambda s: s, enable_ai=False, skip_enrich=True, enable_notify=False)
+            xml1 = ET.fromstring((base / "feeds" / "github_radar.xml").read_text(encoding="utf-8"))
+            self.assertEqual(xml1.findtext("./channel/item/guid"), "github-radar:astral-sh/uv:0.13.8")
+
+            rel_v2 = RepoItem(
+                repo_name="astral-sh/uv",
+                url="https://github.com/astral-sh/uv",
+                description="[Release 0.13.9] Python 3.14 support",
+                language="Rust",
+                stars=50200,
+                forks=1510,
+                sources=["GitHub Releases"],
+                release_tag="0.13.9",
+            )
+            st_v2 = run_pipeline(cfg, base, raw_items_override=[rel_v2], translate_fn=lambda s: s, enable_ai=False, skip_enrich=True, enable_notify=False)
+            self.assertEqual(st_v2["new_count"], 1)
+            xml2 = ET.fromstring((base / "feeds" / "github_radar.xml").read_text(encoding="utf-8"))
+            self.assertEqual(xml2.findtext("./channel/item/guid"), "github-radar:astral-sh/uv:0.13.9")
 
     def test_sqlite_legacy_migration_and_star_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -322,6 +800,8 @@ class TestGitHubRadar(unittest.TestCase):
                 d24, d7 = store.compute_deltas("foo/bar", "2026-11-19", 310)
                 self.assertEqual(d24, 70)
                 self.assertEqual(d7, 210)
+                sparks = store.load_sparklines(["foo/bar"], days=7)
+                self.assertEqual(sparks["foo/bar"], [100, 240])
             finally:
                 store.close()
 
@@ -368,7 +848,8 @@ class TestGitHubRadar(unittest.TestCase):
         self.assertIn("acme/fast-grep", res)
         self.assertEqual(res["acme/fast-grep"]["category_tag"], "效率工具")
 
-    def test_notifier_digest_and_payloads(self) -> None:
+    def test_notifier_digest_chunking_and_telegram_html(self) -> None:
+        """P0-7: Telegram HTML mode safely handles underscores; WeCom/Discord auto-chunk within byte/char limits."""
         items = [
             RepoItem(
                 repo_name="one/solo",
@@ -379,10 +860,10 @@ class TestGitHubRadar(unittest.TestCase):
                 sources=["GitHub Trending"],
             ),
             RepoItem(
-                repo_name="two/hot-gem",
-                url="https://github.com/two/hot-gem",
+                repo_name="two_org/hot_snake_gem",
+                url="https://github.com/two_org/hot_snake_gem",
                 description="Multi source gem",
-                ai_highlight="多源同时命中的极速终端调试器。",
+                ai_highlight="多源同时命中的极速终端调试器 <fast & safe>。",
                 category_tag="效率工具",
                 language="Rust",
                 stars=520,
@@ -392,19 +873,307 @@ class TestGitHubRadar(unittest.TestCase):
         ]
         picked = filter_digest_items(items, {"min_sources": 2, "top_n": 5})
         self.assertEqual(len(picked), 1)
-        self.assertEqual(picked[0].repo_name, "two/hot-gem")
+        self.assertEqual(picked[0].repo_name, "two_org/hot_snake_gem")
 
-        md = build_digest_markdown(picked, {"last_run_date": "2026-11-19", "new_count": 2}, {})
-        self.assertIn("two/hot-gem", md)
+        status = {
+            "last_run_date": "2026-11-19",
+            "new_count": 2,
+            "trend_summary": "终端与 Rust 工具表现活跃。",
+        }
+        md = build_digest_markdown(picked, status, {})
+        self.assertIn("two_org/hot_snake_gem", md)
         self.assertIn("🔥多源×2", md)
         self.assertIn("+190", md)
+        self.assertIn("今日风向标", md)
 
         feishu = build_webhook_payload("feishu", "Title", md, picked)
         self.assertEqual(feishu["msg_type"], "interactive")
         ding = build_webhook_payload("dingtalk", "Title", md, picked)
         self.assertEqual(ding["msgtype"], "markdown")
         tg = build_webhook_payload("telegram", "Title", md, picked)
-        self.assertEqual(tg["parse_mode"], "Markdown")
+        self.assertEqual(tg["parse_mode"], "HTML")
+        self.assertIn("<b>two_org/hot_snake_gem</b>", tg["text"])
+        self.assertIn("&lt;fast &amp; safe&gt;", tg["text"])
+
+        # 35 verbose CJK items (> 6500 UTF-8 bytes) must split cleanly under WeCom 4096-byte and Discord 2000-char limits
+        many_items = [
+            RepoItem(
+                repo_name=f"team_{i}/project_alpha_{i}",
+                url=f"https://github.com/team_{i}/project_alpha_{i}",
+                ai_highlight="这是一个把分布式日志索引压缩到单文件里的轻量检索引擎，无外部依赖开箱即用。",
+                category_tag="系统底层",
+                language="Rust",
+                stars=1000 + i,
+                stars_delta_24h=50 + i,
+                sources=["GitHub Trending", "Show HN"],
+            )
+            for i in range(35)
+        ]
+        wecom_payloads = build_webhook_payloads("wecom", "Title", many_items, status)
+        self.assertGreaterEqual(len(wecom_payloads), 2)
+        for p in wecom_payloads:
+            self.assertLessEqual(len(p["markdown"]["content"].encode("utf-8")), 4096)
+
+        discord_payloads = build_webhook_payloads("discord", "Title", many_items, status)
+        self.assertGreaterEqual(len(discord_payloads), 3)
+        for p in discord_payloads:
+            self.assertLessEqual(len(p["content"]), 2000)
+
+    def test_state_gzip_restore_category_quota_breakout_and_ecosystem_outputs(self) -> None:
+        """P0-6, P0-8, P1-2, P1-3, P1-5: Category anti-flooding, breakout score, XSS URL sanitization, state restore & SKILL.md."""
+        now = datetime(2026, 11, 19, tzinfo=timezone.utc)
+        young = RepoItem(
+            repo_name="new/rocket",
+            url="https://github.com/new/rocket",
+            stars=450,
+            created_at=(now - timedelta(days=5)).isoformat(),
+        )
+        old = RepoItem(
+            repo_name="old/steady",
+            url="https://github.com/old/steady",
+            stars=3000,
+            created_at=(now - timedelta(days=600)).isoformat(),
+        )
+        self.assertAlmostEqual(compute_breakout_score(young, now_utc=now), 90.0)
+        self.assertAlmostEqual(compute_breakout_score(old, now_utc=now), 5.0)
+
+        # Category quota prevents 8 AI repos from occupying >4 slots in the first 10-item window
+        mixed = [
+            *[
+                RepoItem(repo_name=f"ai/agent-{i}", url="https://github.com/ai/a", category_tag="AI应用", stars=900 - i)
+                for i in range(8)
+            ],
+            *[
+                RepoItem(repo_name=f"sys/kernel-{i}", url="https://github.com/sys/k", category_tag="系统底层", stars=200 - i)
+                for i in range(6)
+            ],
+        ]
+        balanced = apply_category_quota(mixed, 0.40, strict_drop=False)
+        first_ten_ai = sum(1 for r in balanced[:10] if r.category_tag == "AI应用")
+        self.assertLessEqual(first_ten_ai, 4)
+        self.assertEqual(len(balanced), 14)
+
+        # Pages URL resolution + malicious javascript: URL sanitization + state backup/restore
+        cfg = self._cfg()
+        with patch.dict(os.environ, {"RADAR_PUBLIC_BASE_URL": "https://demo.github.io/github-radar"}, clear=False):
+            site_u, feeds_u = resolve_site_and_feeds_urls(cfg.output)
+            self.assertEqual(site_u, "https://demo.github.io/github-radar")
+            self.assertEqual(feeds_u, "https://demo.github.io/github-radar/feeds")
+
+            with tempfile.TemporaryDirectory() as tmp:
+                base1 = Path(tmp) / "run1"
+                malicious_disc_item = RepoItem(
+                    repo_name="sec/clean-tool",
+                    url="javascript:alert(1)",
+                    discussion_url="javascript:evil()",
+                    description="Safe systems profiler in Zig",
+                    language="Zig",
+                    stars=260,
+                    forks=19,
+                    created_at=(now - timedelta(days=8)).isoformat(),
+                    sources=["Show HN"],
+                )
+                run_pipeline(
+                    cfg,
+                    base1,
+                    raw_items_override=[malicious_disc_item],
+                    translate_fn=lambda s: s,
+                    enable_ai=False,
+                    skip_enrich=True,
+                    enable_notify=False,
+                )
+                data_js = json.loads((base1 / "feeds" / "data.json").read_text(encoding="utf-8"))
+                self.assertEqual(data_js["items"][0]["url"], "https://github.com/sec/clean-tool")
+                self.assertEqual(data_js["items"][0]["discussion_url"], "")
+                self.assertGreater(data_js["items"][0]["breakout_score"], 25.0)
+
+                jfeed = json.loads((base1 / "feeds" / "feed.json").read_text(encoding="utf-8"))
+                self.assertEqual(jfeed["version"], "https://jsonfeed.org/version/1.1")
+                self.assertEqual(jfeed["feed_url"], "https://demo.github.io/github-radar/feeds/feed.json")
+                self.assertNotIn("external_url", jfeed["items"][0])
+
+                llms_txt = (base1 / "feeds" / "llms.txt").read_text(encoding="utf-8")
+                self.assertIn("https://demo.github.io/github-radar/feeds/data.json", llms_txt)
+                self.assertIn("sec/clean-tool", llms_txt)
+
+                # Simulate cache eviction: restore into fresh base2 from state_backup.json.gz
+                backup_gz = base1 / "feeds" / "state_backup.json.gz"
+                base2 = Path(tmp) / "run2"
+                store2 = RadarStore(base2 / "data" / "radar.db")
+                try:
+                    imported = restore_state_from_source(store2, str(backup_gz))
+                    self.assertEqual(imported, 1)
+                finally:
+                    store2.close()
+
+                st2 = run_pipeline(
+                    cfg,
+                    base2,
+                    raw_items_override=[malicious_disc_item],
+                    translate_fn=lambda s: s,
+                    enable_ai=False,
+                    skip_enrich=True,
+                    enable_notify=False,
+                )
+                self.assertEqual(st2["new_count"], 0)
+
+        skill_md = Path(__file__).resolve().parent.parent / "skills" / "github-radar" / "SKILL.md"
+        self.assertTrue(skill_md.is_file())
+        self.assertIn("name: github-radar", skill_md.read_text(encoding="utf-8"))
+
+    def test_review_regressions_flagship_owner_repo_url_extract_notifier_and_eviction(self) -> None:
+        """Regression suite for ollama/ollama flagship repos, Markdown URL extraction, oversized/surrogate notifications, GraphQL rate-limit stop, and Day-2 DB eviction."""
+        cfg = self._cfg()
+        now = datetime(2026, 11, 19, tzinfo=timezone.utc)
+
+        # 1. Flagship org repos (owner == repo) like ollama/ollama and duckdb/duckdb must NOT be dropped as profile READMEs
+        ollama_rel = RepoItem(
+            repo_name="ollama/ollama",
+            url="https://github.com/ollama/ollama",
+            description="[Release v0.6.0] New multimodal runner",
+            sources=["GitHub Releases"],
+            release_tag="v0.6.0",
+        )
+        self.assertFalse(is_noisy_repo(ollama_rel, cfg.filters, now_utc=now, pre_enrich=True)[0])
+        self.assertFalse(is_noisy_repo(ollama_rel, cfg.filters, now_utc=now, pre_enrich=False)[0])
+
+        duckdb = RepoItem(
+            repo_name="duckdb/duckdb",
+            url="https://github.com/duckdb/duckdb",
+            description="DuckDB is an analytical in-process SQL DBMS",
+            language="C++",
+            stars=28000,
+            forks=2200,
+            created_at=(now - timedelta(days=900)).isoformat(),
+            metadata_enriched=True,
+        )
+        self.assertFalse(is_noisy_repo(duckdb, cfg.filters, now_utc=now)[0])
+
+        # 2. Markdown links, parenthesized URLs, sentence-ending periods, and reserved paths in extract_github_repo_from_url
+        self.assertEqual(
+            extract_github_repo_from_url("Check [proj](https://github.com/owner/repo) now!"),
+            "owner/repo",
+        )
+        self.assertEqual(
+            extract_github_repo_from_url("Code at (https://www.github.com/owner/repo), MIT."),
+            "owner/repo",
+        )
+        self.assertEqual(
+            extract_github_repo_from_url("See https://github.com/owner/repo. Built in Zig."),
+            "owner/repo",
+        )
+        self.assertIsNone(extract_github_repo_from_url("https://github.com/blog/2026-launch"))
+        self.assertIsNone(extract_github_repo_from_url("https://github.com/features/copilot"))
+        self.assertIsNone(extract_github_repo_from_url("https://github.com/users/alice/projects/1"))
+
+        # 3. Single huge item (> 5400 UTF-8 bytes) & lone surrogates in notifier
+        huge_desc = "这是一个零依赖高性能分布式向量检索引擎，" * 90 + " \ud83d <unsafe & raw>"
+        huge_item = [
+            RepoItem(
+                repo_name="acme_corp/super_long_desc_repo",
+                url="https://github.com/acme_corp/super_long_desc_repo",
+                description=huge_desc,
+                desc_cn=huge_desc,
+                language="Rust",
+                stars=1500,
+                sources=["GitHub Trending", "Show HN"],
+            )
+        ]
+        st = {"last_run_date": "2026-11-19", "new_count": 1, "trend_summary": "底层引擎持续升温。"}
+        wecom_p = build_webhook_payloads("wecom", "Title", huge_item, st)
+        self.assertLessEqual(len(wecom_p[0]["markdown"]["content"].encode("utf-8")), 4096)
+        discord_p = build_webhook_payloads("discord", "Title", huge_item, st)
+        self.assertLessEqual(len(discord_p[0]["content"]), 2000)
+        tg_p = build_webhook_payloads("telegram", "Title", huge_item, st)
+        self.assertLessEqual(len(tg_p[0]["text"]), 4096)
+        self.assertEqual(tg_p[0]["text"].count("<b>"), tg_p[0]["text"].count("</b>"))
+        self.assertEqual(tg_p[0]["text"].count("<a "), tg_p[0]["text"].count("</a>"))
+
+        # 4. GraphQL RATE_LIMITED stops immediately without hammering subsequent 50-item chunks
+        many_candidates = [
+            RepoItem(repo_name=f"org/r-{i}", url=f"https://github.com/org/r-{i}", stars=0, sources=["Show HN"])
+            for i in range(110)
+        ]
+        gql_calls = []
+
+        def fake_gql_limited(req, timeout=20):
+            gql_calls.append(req.full_url)
+            return _FakeHTTPResp(
+                json.dumps({"data": None, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]})
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_gql_limited):
+            enrich_github_metadata(many_candidates, github_token="ghs_limited")
+        self.assertEqual(len(gql_calls), 1)
+
+        # 5. Macro AI category normalization covers 模型训练 / 具身智能 / 端侧AI without matching EMAIL
+        self.assertEqual(normalize_macro_category("模型训练"), "AI")
+        self.assertEqual(normalize_macro_category("具身智能"), "AI")
+        self.assertEqual(normalize_macro_category("端侧AI"), "AI")
+        self.assertNotEqual(normalize_macro_category("EMAIL工具"), "AI")
+
+        # 6. Day-1 un-enriched community item evicted when Day-2 enrichment reveals noise; proxy-decoded backup & whitelist revival
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            day1_unverified = RepoItem(
+                repo_name="hn/secretly-markdown",
+                url="https://github.com/hn/secretly-markdown",
+                description="Interesting sounding post on HN",
+                language=None,
+                stars=0,
+                sources=["Show HN"],
+                metadata_enriched=False,
+            )
+            run_pipeline(
+                cfg, base, raw_items_override=[day1_unverified], translate_fn=lambda s: s,
+                enable_ai=False, skip_enrich=True, enable_notify=False,
+            )
+            d1 = json.loads((base / "feeds" / "data.json").read_text(encoding="utf-8"))
+            self.assertEqual(d1["total"], 1)
+
+            day2_enriched_markdown = RepoItem(
+                repo_name="hn/secretly-markdown",
+                url="https://github.com/hn/secretly-markdown",
+                description="Interesting sounding post on HN",
+                language=None,
+                stars=45,
+                sources=["Show HN"],
+                metadata_enriched=True,
+            )
+            run_pipeline(
+                cfg, base, raw_items_override=[day2_enriched_markdown], translate_fn=lambda s: s,
+                enable_ai=False, skip_enrich=True, enable_notify=False,
+            )
+            d2 = json.loads((base / "feeds" / "data.json").read_text(encoding="utf-8"))
+            self.assertEqual(d2["total"], 0)
+
+            # Whitelist revives kept=0 row in reapply_filters, and plain JSON bytes import works
+            cfg_wl = self._cfg()
+            cfg_wl.filters = dict(cfg_wl.filters)
+            cfg_wl.filters["whitelist_repos"] = ["hn/secretly-markdown"]
+            exp_wl = export_only(cfg_wl, base)
+            self.assertEqual(exp_wl["feed_total"], 1)
+
+            store_plain = RadarStore(base / "plain.db")
+            try:
+                plain_bytes = json.dumps(
+                    {
+                        "schema": 1,
+                        "repos": [
+                            {
+                                "canonical_key": "ok/plain-json",
+                                "repo_name": "ok/plain-json",
+                                "sources_json": "CORRUPTED_NOT_JSON",
+                                "kept": 1,
+                            }
+                        ],
+                        "snapshots": [],
+                    }
+                ).encode("utf-8")
+                self.assertEqual(store_plain.import_state_gzip_bytes(plain_bytes), 1)
+                self.assertEqual(len(store_plain.load_recent_kept(limit=5)), 1)
+            finally:
+                store_plain.close()
 
 
 if __name__ == "__main__":
