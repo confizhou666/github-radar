@@ -118,7 +118,7 @@ github-radar/
 ## 本地快速开始与 Docker 部署
 
 ```bash
-git clone https://github.com/confizhou-dotcom/github-radar.git
+git clone https://github.com/confizhou666/github-radar.git
 cd github-radar
 pip install -r requirements.txt
 
