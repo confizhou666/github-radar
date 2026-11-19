@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GitHub Radar · 每日开源精选画刊</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23171A16'/%3E%3Ccircle cx='32' cy='32' r='19' fill='none' stroke='%23E66A43' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='6' fill='%23E66A43'/%3E%3Cline x1='32' y1='32' x2='48' y2='18' stroke='%23FAFBF8' stroke-width='3.5' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="./styles.css?v=2" />
+</head>
+<body>
+  <div class="page-shell">
+    <!-- Editorial Masthead -->
+    <header class="masthead">
+      <div class="masthead-left">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1 class="brand-title">GITHUB RADAR</h1>
+        </div>
+        <p class="brand-sub">每日开源精选画刊 · 全源去噪与一句话导读</p>
+      </div>
+      <div class="masthead-right">
+        <div class="issue-meta" id="issueMeta">正在加载本期数据…</div>
+        <div class="masthead-actions">
+          <button class="icon-pill" id="btnRssModal" type="button" title="RSS 订阅与阅读数据管理">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5" fill="currentColor" stroke="none"/></svg>
+            <span>RSS & 管理</span>
+          </button>
+          <button class="icon-pill icon-only" id="btnTheme" type="button" title="切换深浅阅读模式 (快捷键 D)" aria-label="切换深浅阅读模式">
+            <svg id="themeIconSun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32 1.41-1.41"/></svg>
+            <svg id="themeIconMoon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" hidden><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Sticky Navigation & Filter Strip -->
+    <nav class="control-strip" aria-label="栏目与筛选">
+      <div class="control-row">
+        <div class="bucket-tabs" id="bucketTabs" role="tablist">
+          <button class="tab-btn is-active" data-bucket="all" role="tab" aria-selected="true">
+            全部 <span class="tab-count" data-count="all">0</span>
+          </button>
+          <button class="tab-btn" data-bucket="trending" role="tab" aria-selected="false">
+            Trending <span class="tab-count" data-count="trending">0</span>
+          </button>
+          <button class="tab-btn" data-bucket="radar" role="tab" aria-selected="false">
+            黑马雷达 <span class="tab-count" data-count="radar">0</span>
+          </button>
+          <button class="tab-btn" data-bucket="community" role="tab" aria-selected="false">
+            社区发现 <span class="tab-count" data-count="community">0</span>
+          </button>
+          <button class="tab-btn" data-bucket="saved" role="tab" aria-selected="false">
+            收藏 <span class="tab-count" data-count="saved">0</span>
+          </button>
+        </div>
+
+        <div class="filter-controls">
+          <label class="search-box">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="searchInput" type="search" placeholder="搜索项目或关键词…" autocomplete="off" />
+            <kbd class="kbd-hint">/</kbd>
+          </label>
+
+          <select id="langSelect" class="select-ctrl" aria-label="按编程语言筛选">
+            <option value="">全部语言</option>
+          </select>
+
+          <select id="sortSelect" class="select-ctrl" aria-label="排序方式">
+            <option value="newest">最新发现</option>
+            <option value="stars">Star 最多</option>
+          </select>
+
+          <button id="btnHideRead" class="toggle-ctrl" type="button" aria-pressed="false" title="隐藏已经看过的项目">
+            隐藏已读
+          </button>
+        </div>
+      </div>
+
+      <div class="category-ribbon" id="categoryRibbon" aria-label="按主题筛选"></div>
+    </nav>
+
+    <!-- Active Filter Summary (shown only when filtered) -->
+    <div class="filter-status" id="filterStatus" hidden>
+      <span id="filterStatusText"></span>
+      <button type="button" class="text-link" id="btnResetFilters">清除全部筛选</button>
+    </div>
+
+    <!-- Main Magazine Card Grid -->
+    <main class="feed-main" id="feedMain">
+      <div class="card-grid" id="cardGrid" aria-live="polite"></div>
+      <div class="empty-state" id="emptyState" hidden>
+        <p class="empty-title" id="emptyTitle">这一栏暂时没有匹配的项目</p>
+        <p class="empty-desc" id="emptyDesc">试试放宽筛选条件，或切回「全部」栏目浏览。</p>
+        <button type="button" class="btn-outline" id="btnEmptyReset">重置筛选</button>
+      </div>
+    </main>
+
+    <footer class="page-footer">
+      <span>每日 03:30 自动采集去噪与导读</span>
+      <span class="footer-dot">·</span>
+      <span>点击卡片任意位置滑出详情抽屉 · 快捷键 <kbd>/</kbd> 搜索 <kbd>←</kbd><kbd>→</kbd> 翻篇 <kbd>D</kbd> 换肤</span>
+    </footer>
+  </div>
+
+  <!-- Slide-over Detail Drawer -->
+  <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+  <aside class="detail-drawer" id="detailDrawer" aria-hidden="true" aria-label="项目详情">
+    <div class="drawer-topbar">
+      <div class="drawer-nav">
+        <button type="button" class="drawer-nav-btn" id="btnPrevItem" title="上一篇 (←)">← 上一篇</button>
+        <span class="drawer-pos" id="drawerPos">1 / 1</span>
+        <button type="button" class="drawer-nav-btn" id="btnNextItem" title="下一篇 (→)">下一篇 →</button>
+      </div>
+      <button type="button" class="drawer-close" id="btnCloseDrawer" title="关闭 (Esc)" aria-label="关闭详情">✕</button>
+    </div>
+
+    <div class="drawer-body" id="drawerBody">
+      <!-- Populated dynamically -->
+    </div>
+
+    <div class="drawer-footer" id="drawerFooter">
+      <!-- Populated dynamically -->
+    </div>
+  </aside>
+
+  <!-- RSS & Local State Modal -->
+  <div class="modal-backdrop" id="rssBackdrop" hidden>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="rssModalTitle">
+      <div class="modal-head">
+        <h2 id="rssModalTitle">RSS 订阅地址与本地偏好</h2>
+        <button type="button" class="drawer-close" id="btnCloseRss" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-note">所有去噪分榜依然保留标准 RSS 2.0 静态地址，可直接添加到手机或桌面 RSS 客户端：</p>
+        <div class="rss-list" id="rssList"></div>
+
+        <hr class="modal-divider" />
+        <div class="local-stats-row">
+          <div>
+            <div class="local-stats-title">浏览器本地阅读记录</div>
+            <div class="local-stats-sub" id="localStatsSummary">已收藏 0 · 已读 0 · 已屏蔽 0</div>
+          </div>
+          <div class="local-stats-btns">
+            <button type="button" class="btn-outline small" id="btnClearHidden">恢复屏蔽项</button>
+            <button type="button" class="btn-outline small" id="btnClearRead">清空已读</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="./app.js?v=2" defer></script>
+</body>
+</html>

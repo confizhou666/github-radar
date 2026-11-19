@@ -1,0 +1,27 @@
+# Runtime generated data & feeds
+data/
+feeds/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Environment & local overrides
+.env
+.env.*
+
+# OS & editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.tmp

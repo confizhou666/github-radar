@@ -1,0 +1,148 @@
+sources:
+  github_trending:
+    enabled: true
+    languages:
+      - ""        # 全语言总榜
+    since: "daily"
+    max_items: 30
+
+  github_search:
+    enabled: true
+    queries:
+      - name: "新锐黑马"
+        days_created: 21
+        days_pushed: 7
+        min_stars: 50
+        max_stars: 3000
+        per_page: 25
+      - name: "冷门宝藏"
+        days_created: 14
+        days_pushed: 5
+        min_stars: 20
+        max_stars: 400
+        per_page: 20
+
+  starred_users: []
+
+  hackernews_show:
+    enabled: true
+    limit: 30
+
+  hellogithub:
+    enabled: true
+    limit: 25
+
+  reddit_rss:
+    enabled: true
+    subreddits:
+      - "opensource"
+      - "SideProject"
+      - "selfhosted"
+
+  extra_rss_urls: []
+
+filters:
+  require_programming_language: true
+  drop_profile_readmes: true
+  max_repo_age_years: 5
+  anti_star_farm: true
+  min_desc_chars: 6
+  blacklist_keywords:
+    # 1. 资源合集 / 笔记路线图
+    - "awesome-"
+    - "awesome "
+    - "-list"
+    - "curated-list"
+    - "curated list"
+    - "cheat-sheet"
+    - "cheatsheet"
+    - "roadmap"
+    - "collection"
+    - "bookmarks"
+    - "resources"
+    - "合集"
+    - "资源汇总"
+    - "路线图"
+    - "学习笔记"
+    - "书单"
+    - "导航"
+    # 2. 面试八股 / 刷题
+    - "interview"
+    - "leetcode"
+    - "system-design-primer"
+    - "algorithm-notes"
+    - "面试"
+    - "八股"
+    - "面经"
+    - "校招"
+    - "刷题"
+    - "秋招"
+    - "春招"
+    - "真题"
+    # 3. 纯教程 / 毕设模板
+    - "tutorial"
+    - "for-beginners"
+    - "100-days-of-"
+    - "step-by-step"
+    - "starter-template"
+    - "从零开始"
+    - "手把手"
+    - "实战教程"
+    - "毕设"
+    - "课设"
+    - "大作业"
+    - "基于springboot"
+    - "管理系统"
+    # 4. AI Prompt / 套壳卖课引流
+    - "prompts"
+    - "chatgpt-prompts"
+    - "claude-prompts"
+    - "system-prompts"
+    - "cursor-rules"
+    - "ai-directory"
+    - "ai-tools-list"
+    - "gpt-nav"
+    - "one-click-deploy"
+    - "副业"
+    - "变现"
+    - "公众号"
+    - "微信群"
+    - "扫码"
+    - "加群"
+    - "领资料"
+    - "日入"
+    - "一键赚钱"
+    # 5. 白嫖节点 / 灰产脚本
+    - "free-api"
+    - "free-key"
+    - "free-nodes"
+    - "proxy-pool"
+    - "v2ray"
+    - "clash"
+    - "免费节点"
+    - "自动签到"
+    - "抢票"
+    - "抢茅台"
+    - "刷课"
+    - "薅羊毛"
+    - "jd_scripts"
+    - "crack"
+    - "keygen"
+    - "激活码"
+    - "破解"
+
+translation:
+  enabled: true
+  provider: "google_gtx"
+
+ai_highlight:
+  enabled: true
+  agy_executable: "agy"
+  model: "gemini-4-hydrogen-medium"
+  max_batch_items: 25
+  timeout_seconds: 90
+
+output:
+  max_feed_items: 120
+  max_web_items: 300
+  public_base_url: "http://localhost:8088/feeds"

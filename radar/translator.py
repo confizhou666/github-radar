@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+import shutil
+import subprocess
+from typing import Any, Callable, Dict, List, Optional
+import urllib.parse
+import urllib.request
+
+from .models import RepoItem
+
+logger = logging.getLogger(__name__)
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+HIGHLIGHT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "repo_name": {"type": "string"},
+                    "keep": {
+                        "type": "boolean",
+                        "description": "True if genuinely interesting/useful software; False if disguised spam, SEO wrapper, prompt dump, or pure tutorial",
+                    },
+                    "category_tag": {
+                        "type": "string",
+                        "description": "2~6字中文分类标签，如：效率工具、AI应用、系统底层、创意玩具、开发框架",
+                    },
+                    "highlight": {
+                        "type": "string",
+                        "description": "1句中文亮点（20~55字）：直白说清这个项目好玩或有用在哪里，禁止套话",
+                    },
+                },
+                "required": ["repo_name", "keep", "category_tag", "highlight"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+
+def _contains_mostly_cjk(text: str) -> bool:
+    if not text:
+        return True
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    return cjk >= max(4, len(text) * 0.25)
+
+
+def translate_free_zh(text: str) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+    if _contains_mostly_cjk(clean):
+        return clean
+
+    # 1. Free Google Translate gtx endpoint
+    try:
+        q = urllib.parse.quote(clean[:800])
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q={q}"
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                translated = "".join(str(seg[0]) for seg in data[0] if isinstance(seg, list) and seg and seg[0])
+                if translated.strip():
+                    return translated.strip()
+    except Exception as exc:
+        logger.debug("google_gtx 翻译失败，尝试备用接口: %s", exc)
+
+    # 2. Free MyMemory fallback
+    try:
+        q = urllib.parse.quote(clean[:450])
+        url = f"https://api.mymemory.translated.net/get?q={q}&langpair=en|zh-CN"
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            js = json.loads(resp.read().decode("utf-8", errors="replace"))
+            txt = str((js.get("responseData") or {}).get("translatedText") or "").strip()
+            if txt:
+                return txt
+    except Exception as exc:
+        logger.debug("mymemory 翻译失败: %s", exc)
+
+    return clean
+
+
+def generate_ai_highlights(
+    items: List[RepoItem],
+    ai_cfg: Dict[str, Any],
+    *,
+    runner: Optional[Callable[[str], str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Run one batched LLM call to generate 1-sentence highlights & semantic spam filtering."""
+    if not items or not ai_cfg.get("enabled", True):
+        return {}
+
+    max_batch = max(1, int(ai_cfg.get("max_batch_items") or 25))
+    batch = items[:max_batch]
+    payload_lines = [
+        f"- {r.repo_name} | lang={r.language or 'unknown'} | stars={r.stars} | desc={(r.desc_cn or r.description)[:200]}"
+        for r in batch
+    ]
+    prompt = (
+        "你是资深开源工具发掘编辑。下面是一批已初步去噪的 GitHub 项目列表。\n"
+        "请逐条评估并输出 JSON：\n"
+        "1. `keep`: 如果实质是八股面试、纯教程、资源链接合集、Prompt 文本堆砌、引流壳站或灰产脚本，设为 false；真正有代码创意或实用价值设为 true。\n"
+        "2. `category_tag`: 给一个 2~6 字中文分类（如 效率工具 / AI应用 / 系统底层 / 好玩创意 / 开发框架 / 桌面神器）。\n"
+        "3. `highlight`: 用一句大白话（20~55字）直指核心：它到底解决什么痛点、或有什么有趣脑洞？严禁“功能强大/值得收藏/赋能/重磅”等空话。\n\n"
+        + "\n".join(payload_lines)
+    )
+
+    raw_stdout = ""
+    if runner is not None:
+        raw_stdout = runner(prompt)
+    else:
+        exe = str(ai_cfg.get("agy_executable") or "agy")
+        if not shutil.which(exe):
+            logger.info("未找到 %s，跳过 AI 一句话亮点生成", exe)
+            return {}
+        model = str(ai_cfg.get("model") or "gemini-4-hydrogen-medium")
+        timeout = int(ai_cfg.get("timeout_seconds") or 90)
+        cmd = [
+            exe,
+            "-p",
+            prompt,
+            "--model",
+            model,
+            "--output-format",
+            "json",
+            "--disable-slash-commands",
+            "--json-schema",
+            json.dumps(HIGHLIGHT_SCHEMA, ensure_ascii=False),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if proc.returncode != 0:
+                logger.warning("agy 亮点生成返回非0 (%s): %s", proc.returncode, proc.stderr[-200:])
+                return {}
+            raw_stdout = proc.stdout
+        except Exception as exc:
+            logger.warning("agy 亮点生成异常: %s", exc)
+            return {}
+
+    return _parse_highlight_output(raw_stdout)
+
+
+def _parse_highlight_output(raw_stdout: str) -> Dict[str, Dict[str, Any]]:
+    if not (raw_stdout or "").strip():
+        return {}
+    parsed: Any = None
+    try:
+        outer = json.loads(raw_stdout)
+        if isinstance(outer, dict):
+            parsed = outer.get("structured_output")
+            if parsed is None and isinstance(outer.get("items"), list):
+                parsed = outer
+            elif parsed is None and isinstance(outer.get("response"), str):
+                parsed = json.loads(outer["response"])
+    except Exception:
+        pass
+
+    if not isinstance(parsed, dict):
+        m = re.search(r"\{.*\}", raw_stdout, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+            except Exception:
+                parsed = None
+
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for entry in parsed["items"]:
+        if not isinstance(entry, dict):
+            continue
+        rname = str(entry.get("repo_name") or "").strip().lower()
+        if not rname:
+            continue
+        result[rname] = {
+            "keep": bool(entry.get("keep", True)),
+            "category_tag": str(entry.get("category_tag") or "").strip()[:16],
+            "highlight": str(entry.get("highlight") or "").strip()[:120],
+        }
+    return result
