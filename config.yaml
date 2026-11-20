@@ -1,7 +1,7 @@
 network:
   # 可选：代理地址（如 http://127.0.0.1:7897），也可通过环境变量 RADAR_PROXY 传入
   proxy: ""
-  # 可选：读取 GitHub Token 的环境变量名（提升 Search/GraphQL 元信息补充限流配额，并支持 GitHub Models 免费导读）
+  # 可选：读取 GitHub Token 的环境变量名（提升 Search/GraphQL 批量元信息补全的限流配额）
   github_token_env: "GITHUB_TOKEN"
   # max_enrich: 100
   # max_workers: 6
@@ -51,8 +51,9 @@ sources:
       - "ollama/ollama"
 
   reddit_rss:
-    enabled: true
-    # 可替换为自建 RSSHub 前缀，例如 "https://rsshub.example.com/reddit/subreddit"
+    # 公共 Reddit .rss 在无代理云端常返回 404/429，默认关闭；配置代理或任意域名自建 RSSHub 后可开启
+    enabled: false
+    # 支持官方域名、任意域名自建 RSSHub（如 "https://rss.example.com" 或 "https://rss.example.com/reddit/subreddit"）或含 {subreddit} 占位符的模板
     rss_base_url: "https://www.reddit.com"
     subreddits:
       - "opensource"
@@ -67,7 +68,7 @@ filters:
   max_repo_age_years: 5
   anti_star_farm: true
   min_desc_chars: 6
-  min_stars: 0
+  min_stars: 5
   # 白名单仓库（owner/repo），命中后跳过关键词/语言等常规去噪过滤
   whitelist_repos: []
   # 屏蔽高频刷榜或营销号作者/组织（owner）
@@ -176,13 +177,10 @@ translation:
 
 ai_highlight:
   enabled: true
-  # auto: 优先读取 OpenAI 兼容 API Key，其次自动使用 GITHUB_TOKEN 调 GitHub Models，最后回退本地 agy CLI
+  # auto: 优先读取 OpenAI 兼容接口密钥（RADAR_AI_API_KEY），其次回退本地 agy CLI；无密钥时自动由本地确定性规则分类器兜底中文分类标签
   provider: "auto"
   base_url: "https://api.openai.com/v1"
   openai_model: "gpt-4o-mini"
-  github_model: "openai/gpt-4o-mini"
-  github_models_batch_items: 10
-  use_github_models: true
   api_key_env: "RADAR_AI_API_KEY"
   agy_executable: "agy"
   model: "gemini-4-hydrogen-medium"
@@ -208,6 +206,8 @@ notifications:
 output:
   max_feed_items: 120
   max_web_items: 300
+  # 统一业务日期与快照时区（消除 GitHub Actions UTC 凌晨运行跨日错位；可通过 RADAR_TIMEZONE 覆盖）
+  timezone: "Asia/Shanghai"
   # 单一主题在每屏/榜单中的配额上限（0.40 = 单类最多占 40%，防止 AI 刷屏淹没底层工具；设为 0 关闭）
   max_category_share: 0.40
   public_base_url: "http://localhost:8088/feeds"

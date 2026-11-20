@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Pattern, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,8 +21,6 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-
-GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference/chat/completions"
 
 HIGHLIGHT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -42,7 +41,7 @@ HIGHLIGHT_SCHEMA: Dict[str, Any] = {
                     },
                     "category_tag": {
                         "type": "string",
-                        "description": "2~6字中文分类标签，如：效率工具、AI应用、系统底层、创意玩具、开发框架",
+                        "description": "从以下9个标准中文分类中选择最贴切的1个：效率工具、AI应用、模型推理、系统底层、数据存储、安全网络、创意玩具、开发框架、桌面工具",
                     },
                     "highlight": {
                         "type": "string",
@@ -55,6 +54,534 @@ HIGHLIGHT_SCHEMA: Dict[str, Any] = {
     },
     "required": ["items"],
 }
+
+# Deterministic zero-cost local category rules: (category_tag, english_tokens, cjk_phrases)
+_CATEGORY_RULES: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = [
+    (
+        "模型推理",
+        (
+            "vllm",
+            "gguf",
+            "llama-cpp",
+            "llama.cpp",
+            "quantization",
+            "fine-tuning",
+            "finetuning",
+            "lora",
+            "qlora",
+            "pytorch",
+            "tensorrt",
+            "onnx",
+            "mlx",
+            "diffusion",
+            "stable-diffusion",
+            "text-to-speech",
+            "speech-to-text",
+            "speech-recognition",
+            "tts",
+            "asr",
+            "whisper",
+            "vision-language",
+            "vlm",
+            "multimodal",
+            "transformer",
+            "neural-network",
+            "deep-learning",
+            "machine-learning",
+            "reinforcement-learning",
+            "rlhf",
+            "grpo",
+            "embedding",
+            "reranker",
+            "triton",
+            "inference-engine",
+            "llm-inference",
+        ),
+        (
+            "推理引擎",
+            "模型推理",
+            "本地推理",
+            "量化",
+            "微调",
+            "模型训练",
+            "预训练",
+            "语音合成",
+            "语音识别",
+            "多模态",
+            "扩散模型",
+            "注意力机制",
+            "神经网络",
+            "强化学习",
+        ),
+    ),
+    (
+        "AI应用",
+        (
+            "llm",
+            "llms",
+            "gpt",
+            "chatgpt",
+            "claude",
+            "claude-code",
+            "anthropic",
+            "gemini",
+            "openai",
+            "deepseek",
+            "qwen",
+            "ollama",
+            "agent",
+            "agents",
+            "multi-agent",
+            "agentic",
+            "mcp",
+            "model-context-protocol",
+            "rag",
+            "langchain",
+            "llamaindex",
+            "dify",
+            "comfyui",
+            "copilot",
+            "cursor",
+            "codex",
+            "aigc",
+            "chatbot",
+            "ai-agent",
+            "ai-assistant",
+            "ai-coding",
+            "coding-agent",
+            "ai",
+        ),
+        (
+            "智能体",
+            "大模型",
+            "知识库",
+            "对话机器人",
+            "编程助手",
+            "AI助手",
+            "AI代理",
+            "检索增强",
+            "文生图",
+            "文生视频",
+        ),
+    ),
+    (
+        "安全网络",
+        (
+            "security",
+            "cybersecurity",
+            "pentest",
+            "pentesting",
+            "vulnerability",
+            "cve",
+            "exploit",
+            "fuzzing",
+            "fuzzer",
+            "reverse-engineering",
+            "decompiler",
+            "disassembler",
+            "forensics",
+            "waf",
+            "firewall",
+            "vpn",
+            "wireguard",
+            "socks5",
+            "tunnel",
+            "intranet",
+            "dns",
+            "tls",
+            "mtls",
+            "oauth",
+            "oidc",
+            "passkey",
+            "zero-trust",
+            "encryption",
+            "cryptography",
+            "packet",
+        ),
+        (
+            "网络安全",
+            "漏洞",
+            "渗透",
+            "逆向",
+            "防火墙",
+            "内网穿透",
+            "加密",
+            "鉴权",
+            "零信任",
+            "抓包",
+            "审计",
+        ),
+    ),
+    (
+        "数据存储",
+        (
+            "database",
+            "sql",
+            "sqlite",
+            "postgres",
+            "postgresql",
+            "mysql",
+            "duckdb",
+            "clickhouse",
+            "parquet",
+            "arrow",
+            "apache-arrow",
+            "olap",
+            "oltp",
+            "vector-db",
+            "vector-database",
+            "qdrant",
+            "milvus",
+            "lancedb",
+            "kv-store",
+            "rocksdb",
+            "lsm-tree",
+            "redis",
+            "valkey",
+            "s3",
+            "object-storage",
+            "distributed-storage",
+            "kafka",
+            "message-queue",
+            "etl",
+            "cdc",
+            "dataframe",
+            "polars",
+            "search-engine",
+            "full-text-search",
+        ),
+        (
+            "数据库",
+            "向量检索",
+            "向量库",
+            "存储引擎",
+            "对象存储",
+            "消息队列",
+            "数据仓库",
+            "列式存储",
+            "全文检索",
+            "检索引擎",
+        ),
+    ),
+    (
+        "系统底层",
+        (
+            "kernel",
+            "linux-kernel",
+            "operating-system",
+            "osdev",
+            "unikernel",
+            "rtos",
+            "embedded",
+            "firmware",
+            "stm32",
+            "esp32",
+            "riscv",
+            "risc-v",
+            "hypervisor",
+            "kvm",
+            "qemu",
+            "microvm",
+            "virtualization",
+            "sandbox",
+            "container-runtime",
+            "ebpf",
+            "bpf",
+            "wasm",
+            "webassembly",
+            "wasi",
+            "compiler",
+            "llvm",
+            "jit",
+            "garbage-collection",
+            "allocator",
+            "syscall",
+            "driver",
+            "filesystem",
+            "fuse",
+            "cuda",
+            "vulkan",
+            "opengl",
+            "webgpu",
+        ),
+        (
+            "操作系统",
+            "内核",
+            "编译器",
+            "虚拟机",
+            "嵌入式",
+            "固件",
+            "文件系统",
+            "字节码",
+            "内存分配",
+            "垃圾回收",
+            "显卡",
+            "驱动",
+        ),
+    ),
+    (
+        "创意玩具",
+        (
+            "game",
+            "gamedev",
+            "game-engine",
+            "godot",
+            "bevy",
+            "raylib",
+            "retro",
+            "emulator",
+            "gameboy",
+            "nes",
+            "pixel-art",
+            "voxel",
+            "shader",
+            "generative-art",
+            "synth",
+            "synthesizer",
+            "midi",
+            "daw",
+            "webaudio",
+            "ascii-art",
+            "animation",
+            "historical-atlas",
+            "atlas",
+            "interactive-map",
+            "astronomy",
+            "planetarium",
+            "chess",
+            "puzzle",
+            "simulation",
+        ),
+        (
+            "游戏",
+            "合成器",
+            "编曲",
+            "像素",
+            "着色器",
+            "动画",
+            "历史地图",
+            "交互地图",
+            "模拟器",
+            "天文",
+            "创意",
+        ),
+    ),
+    (
+        "桌面工具",
+        (
+            "desktop",
+            "desktop-app",
+            "macos",
+            "menubar",
+            "menu-bar",
+            "windows-app",
+            "wpf",
+            "winui",
+            "tauri",
+            "electron",
+            "wails",
+            "flutter",
+            "swiftui",
+            "appkit",
+            "gtk",
+            "qt",
+            "wayland",
+            "hyprland",
+            "gui",
+            "clipboard",
+            "screenshot",
+            "screen-recorder",
+            "video-editor",
+            "image-editor",
+            "pdf-viewer",
+            "ebook",
+            "epub",
+            "markdown-editor",
+            "note-taking",
+            "launcher",
+            "wallpaper",
+            "media-player",
+        ),
+        (
+            "桌面端",
+            "桌面应用",
+            "客户端",
+            "菜单栏",
+            "状态栏",
+            "剪贴板",
+            "截图",
+            "录屏",
+            "阅读器",
+            "笔记",
+            "播放器",
+            "壁纸",
+        ),
+    ),
+    (
+        "开发框架",
+        (
+            "framework",
+            "web-framework",
+            "ui-library",
+            "component-library",
+            "design-system",
+            "sdk",
+            "react",
+            "nextjs",
+            "vue",
+            "nuxt",
+            "svelte",
+            "solidjs",
+            "angular",
+            "astro",
+            "htmx",
+            "tailwindcss",
+            "orm",
+            "graphql",
+            "grpc",
+            "rpc",
+            "router",
+            "middleware",
+            "state-management",
+            "bundler",
+            "vite",
+            "linter",
+            "formatter",
+            "type-checker",
+            "lsp",
+            "parser",
+            "virtual-list",
+            "ioc",
+        ),
+        (
+            "前端框架",
+            "组件库",
+            "开发框架",
+            "状态管理",
+            "中间件",
+            "打包器",
+            "语法解析",
+            "依赖注入",
+        ),
+    ),
+    (
+        "效率工具",
+        (
+            "cli",
+            "command-line",
+            "tui",
+            "terminal",
+            "shell",
+            "zsh",
+            "bash",
+            "tmux",
+            "neovim",
+            "vim",
+            "emacs",
+            "dotfiles",
+            "git",
+            "github-actions",
+            "ci-cd",
+            "devops",
+            "docker",
+            "kubernetes",
+            "k8s",
+            "helm",
+            "terraform",
+            "monitoring",
+            "observability",
+            "profiler",
+            "benchmark",
+            "package-manager",
+            "resolver",
+            "automation",
+            "scraper",
+            "crawler",
+            "self-hosted",
+            "selfhosted",
+            "homelab",
+            "converter",
+            "downloader",
+        ),
+        (
+            "命令行",
+            "终端",
+            "包管理",
+            "自动化",
+            "自托管",
+            "监控",
+            "性能分析",
+            "下载器",
+            "转换器",
+        ),
+    ),
+]
+
+_LANG_CATEGORY_FALLBACK: Dict[str, str] = {
+    "C": "系统底层",
+    "Assembly": "系统底层",
+    "Zig": "系统底层",
+    "Verilog": "系统底层",
+    "SystemVerilog": "系统底层",
+    "Swift": "桌面工具",
+    "Kotlin": "桌面工具",
+    "Dart": "桌面工具",
+    "Objective-C": "桌面工具",
+    "C#": "桌面工具",
+    "Vue": "开发框架",
+    "Svelte": "开发框架",
+    "CSS": "开发框架",
+    "HTML": "开发框架",
+    "TypeScript": "开发框架",
+    "JavaScript": "开发框架",
+    "SQL": "数据存储",
+    "Jupyter Notebook": "模型推理",
+}
+
+
+@lru_cache(maxsize=512)
+def _compile_token_pattern(token: str) -> Pattern[str]:
+    escaped = re.escape(token.lower())
+    return re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", re.IGNORECASE)
+
+
+def classify_repo_category(item: RepoItem) -> str:
+    """Deterministically classify a repository into a concise Chinese category tag without LLM calls."""
+    existing = (item.category_tag or "").strip()
+    if existing:
+        return existing[:16]
+
+    topics_lower = [str(t or "").strip().lower() for t in (item.topics or []) if str(t or "").strip()]
+    topics_blob = " ".join(topics_lower)
+    slug_words = re.sub(r"[/._-]+", " ", (item.repo_name or "").lower())
+    desc_en = (item.description or "").lower()
+    desc_zh = item.desc_cn or ""
+    en_haystack = f"{slug_words} {topics_blob} {desc_en}"
+    zh_haystack = f"{desc_zh} {item.description or ''}"
+
+    scores: Dict[str, float] = {cat: 0.0 for cat, _, _ in _CATEGORY_RULES}
+
+    if "HuggingFace Papers" in (item.sources or []):
+        scores["模型推理"] += 2.2
+
+    for cat, en_tokens, zh_phrases in _CATEGORY_RULES:
+        for tok in en_tokens:
+            if tok in topics_lower:
+                scores[cat] += 3.0
+            elif _compile_token_pattern(tok).search(en_haystack):
+                scores[cat] += 1.6
+        for phrase in zh_phrases:
+            if phrase in zh_haystack:
+                scores[cat] += 1.8
+
+    best_cat, best_score = max(scores.items(), key=lambda kv: kv[1])
+    if best_score > 0.0:
+        return best_cat
+
+    lang = (item.language or "").strip()
+    if lang in _LANG_CATEGORY_FALLBACK:
+        return _LANG_CATEGORY_FALLBACK[lang]
+    return "效率工具"
 
 
 def _open_url(req: urllib.request.Request, *, timeout: int = 12, proxy: str = ""):
@@ -112,22 +639,6 @@ def translate_free_zh(text: str, *, proxy: str = "") -> str:
         logger.debug("mymemory 翻译失败: %s", exc)
 
     return clean
-
-
-def _normalize_github_model_name(raw_model: str) -> str:
-    m = (raw_model or "openai/gpt-4o-mini").strip()
-    if "/" in m:
-        return m
-    lower = m.lower()
-    if lower.startswith(("gpt-", "o1", "o3", "o4")):
-        return f"openai/{m}"
-    if lower.startswith("llama"):
-        return f"meta/{m}"
-    if lower.startswith("deepseek"):
-        return f"deepseek/{m}"
-    if lower.startswith("mistral") or lower.startswith("codestral"):
-        return f"mistral-ai/{m}"
-    return f"openai/{m}"
 
 
 def _resolve_openai_settings(ai_cfg: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -200,7 +711,11 @@ def _call_chat_completions(
                         msg = choices[0].get("message") or {}
                         return str(msg.get("content") or "")
                     if "error" in outer:
-                        logger.warning("大模型接口 (%s) 返回错误载荷: %s", endpoint, str(outer["error"])[:200])
+                        logger.warning(
+                            "大模型接口 (%s) 返回错误载荷: %s",
+                            endpoint,
+                            str(outer["error"])[:200],
+                        )
                         return ""
                 return raw
         except urllib.error.HTTPError as exc:
@@ -208,6 +723,9 @@ def _call_chat_completions(
                 body.pop("response_format", None)
                 continue
             logger.warning("大模型接口 (%s) 返回 HTTP %s: %s", endpoint, exc.code, exc.reason)
+            return ""
+        except json.JSONDecodeError:
+            logger.warning("大模型接口 (%s) 返回非 JSON 文本: %r", endpoint, raw[:80])
             return ""
         except Exception as exc:
             logger.warning("大模型接口 (%s) 调用异常: %s", endpoint, exc)
@@ -239,35 +757,6 @@ def _run_openai_compatible(
     )
 
 
-def _run_github_models(
-    prompt: str,
-    ai_cfg: Dict[str, Any],
-    *,
-    github_token: str,
-    proxy: str = "",
-    include_trend_summary: bool = False,
-) -> str:
-    if not github_token:
-        return ""
-    raw_model = str(
-        os.environ.get("RADAR_AI_MODEL", "")
-        or ai_cfg.get("github_model")
-        or ai_cfg.get("openai_model")
-        or "openai/gpt-4o-mini"
-    ).strip()
-    model = _normalize_github_model_name(raw_model)
-    timeout = int(ai_cfg.get("timeout_seconds") or 60)
-    return _call_chat_completions(
-        prompt,
-        endpoint=GITHUB_MODELS_ENDPOINT,
-        api_key=github_token,
-        model=model,
-        timeout=timeout,
-        proxy=proxy,
-        include_trend_summary=include_trend_summary,
-    )
-
-
 def _run_agy_cli(prompt: str, ai_cfg: Dict[str, Any]) -> str:
     exe = str(ai_cfg.get("agy_executable") or "agy")
     resolved_exe = shutil.which(exe)
@@ -291,7 +780,9 @@ def _run_agy_cli(prompt: str, ai_cfg: Dict[str, Any]) -> str:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
         if proc.returncode != 0:
-            logger.warning("agy 亮点生成返回非0 (%s): %s", proc.returncode, (proc.stderr or "")[-200:])
+            logger.warning(
+                "agy 亮点生成返回非0 (%s): %s", proc.returncode, (proc.stderr or "")[-200:]
+            )
             return ""
         return proc.stdout or ""
     except Exception as exc:
@@ -313,7 +804,7 @@ def _build_batch_prompt(batch: List[RepoItem], *, want_trend_summary: bool = Fal
         "你是资深开源工具发掘编辑。下面是一批已初步去噪的 GitHub 项目列表。\n"
         "请逐条评估并输出 JSON：\n"
         "1. `keep`: 如果实质是八股面试、纯教程、资源链接合集、Prompt 文本堆砌、盗版安装器/外挂壳仓、引流壳站或灰产脚本，设为 false；真正有代码创意或实用价值设为 true。\n"
-        "2. `category_tag`: 给一个 2~6 字中文分类（如 效率工具 / AI应用 / 系统底层 / 创意玩具 / 开发框架 / 桌面工具）。\n"
+        "2. `category_tag`: 优先从以下 9 个标准中文分类中选 1 个：效率工具 / AI应用 / 模型推理 / 系统底层 / 数据存储 / 安全网络 / 创意玩具 / 开发框架 / 桌面工具。\n"
         "3. `highlight`: 用一句大白话（20~55字）直指核心：它到底解决什么痛点、或有什么有趣脑洞？严禁“功能强大/值得收藏/赋能/重磅”等空话。\n"
         + trend_rule
         + "\n".join(payload_lines)
@@ -329,17 +820,22 @@ def generate_ai_highlights(
     github_token: str = "",
     trend_summary_out: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """Run chunked LLM calls via configured provider (auto / openai / github_models / agy) to generate highlights."""
+    """Run chunked LLM calls via configured provider (auto / openai / agy) to generate highlights."""
+    _ = github_token
     if not items or not ai_cfg.get("enabled", True):
         return {}
 
     eff_proxy = proxy or os.environ.get("RADAR_PROXY", "").strip()
-    eff_gh_token = (github_token or os.environ.get("GITHUB_TOKEN", "")).strip()
     provider = str(ai_cfg.get("provider") or "auto").strip().lower()
     base_url, api_key, _ = _resolve_openai_settings(ai_cfg)
     has_openai = bool(api_key or "localhost" in base_url or "127.0.0.1" in base_url)
-    has_gh_models = bool(eff_gh_token and ai_cfg.get("use_github_models", True))
     has_agy = bool(shutil.which(str(ai_cfg.get("agy_executable") or "agy")))
+
+    if provider == "github_models":
+        logger.warning(
+            "GitHub Models (models.github.ai) 官方推理接口已下线退役，跳过调用并交由本地确定性规则分类兜底；如需 AI 一句话导读请配置 RADAR_AI_API_KEY"
+        )
+        return {}
 
     candidate_modes: List[str] = []
     if runner is not None:
@@ -347,26 +843,20 @@ def generate_ai_highlights(
     elif provider == "openai":
         if has_openai:
             candidate_modes = ["openai"]
-    elif provider == "github_models":
-        if eff_gh_token:
-            candidate_modes = ["github_models"]
     elif provider == "agy":
         if has_agy:
             candidate_modes = ["agy"]
     else:
         if has_openai:
             candidate_modes.append("openai")
-        if has_gh_models:
-            candidate_modes.append("github_models")
         if has_agy:
             candidate_modes.append("agy")
 
     if not candidate_modes:
-        logger.info("未检测到可用 AI Provider（API Key / GITHUB_TOKEN / agy CLI），跳过 AI 导读")
+        logger.info("未检测到可用大模型 Provider（RADAR_AI_API_KEY / 本地 agy CLI），跳过 AI 导读并启用本地规则分类兜底")
         return {}
 
     max_batch = max(1, int(ai_cfg.get("max_batch_items") or 25))
-    gh_batch = max(1, int(ai_cfg.get("github_models_batch_items") or 10))
     max_chunks = max(1, int(ai_cfg.get("max_chunks_per_run") or 8))
 
     def _invoke_mode(mode: str, prompt: str, *, want_summary: bool) -> str:
@@ -375,14 +865,6 @@ def generate_ai_highlights(
         if mode == "openai":
             return _run_openai_compatible(
                 prompt, ai_cfg, proxy=eff_proxy, include_trend_summary=want_summary
-            )
-        if mode == "github_models":
-            return _run_github_models(
-                prompt,
-                ai_cfg,
-                github_token=eff_gh_token,
-                proxy=eff_proxy,
-                include_trend_summary=want_summary,
             )
         if mode == "agy":
             return _run_agy_cli(prompt, ai_cfg)
@@ -394,8 +876,7 @@ def generate_ai_highlights(
     chunk_idx = 0
 
     while cursor < len(items) and chunk_idx < max_chunks:
-        chunk_size = min(max_batch, gh_batch) if active_mode == "github_models" else max_batch
-        batch = items[cursor : cursor + chunk_size]
+        batch = items[cursor : cursor + max_batch]
         want_summary = chunk_idx == 0 and trend_summary_out is not None and not trend_summary_out
         prompt = _build_batch_prompt(batch, want_trend_summary=want_summary)
 
@@ -407,23 +888,19 @@ def generate_ai_highlights(
         if not batch_map and chunk_idx == 0 and len(candidate_modes) > 1:
             for fallback_mode in candidate_modes[1:]:
                 logger.info("AI Provider (%s) 未返回有效导读，自动回退尝试 %s", active_mode, fallback_mode)
-                fb_size = min(max_batch, gh_batch) if fallback_mode == "github_models" else max_batch
-                batch = items[cursor : cursor + fb_size]
-                prompt = _build_batch_prompt(batch, want_trend_summary=want_summary)
                 raw_stdout = _invoke_mode(fallback_mode, prompt, want_summary=want_summary)
                 fb_map, fb_summary = (
                     _parse_highlight_output_with_summary(raw_stdout) if raw_stdout else ({}, "")
                 )
                 if fb_map:
                     active_mode = fallback_mode
-                    chunk_size = fb_size
                     batch_map, batch_summary = fb_map, fb_summary
                     break
 
         if not batch_map:
             if chunk_idx == 0:
                 break
-            cursor += chunk_size
+            cursor += max_batch
             chunk_idx += 1
             continue
 

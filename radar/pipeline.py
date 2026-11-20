@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 import gzip
 import json
 import logging
@@ -11,7 +11,7 @@ import sqlite3
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import urllib.request
 
-from .config import RadarConfig
+from .config import RadarConfig, resolve_timezone
 from .feed_builder import (
     apply_category_quota,
     classify_bucket,
@@ -27,6 +27,7 @@ from .models import RepoItem
 from .notifier import send_notifications
 from .sources import (
     UA,
+    _needs_enrichment,
     collect_all_sources,
     enrich_github_metadata,
     resolve_github_token,
@@ -35,6 +36,7 @@ from .sources import (
 )
 from .translator import (
     build_fallback_trend_summary,
+    classify_repo_category,
     generate_ai_highlights,
     translate_free_zh,
 )
@@ -75,8 +77,10 @@ class RadarStore:
                 topics_json TEXT NOT NULL DEFAULT '[]',
                 license_name TEXT NOT NULL DEFAULT '',
                 release_tag TEXT NOT NULL DEFAULT '',
-                community_score INTEGER NOT NULL DEFAULT 0,
+                    community_score INTEGER NOT NULL DEFAULT 0,
                 last_seen_date TEXT NOT NULL DEFAULT '',
+                metadata_enriched INTEGER NOT NULL DEFAULT 0,
+                ai_rejected INTEGER NOT NULL DEFAULT 0,
                 kept INTEGER NOT NULL DEFAULT 1,
                 discovered_at TEXT NOT NULL
             );
@@ -103,10 +107,18 @@ class RadarStore:
             ("release_tag", "TEXT NOT NULL DEFAULT ''"),
             ("community_score", "INTEGER NOT NULL DEFAULT 0"),
             ("last_seen_date", "TEXT NOT NULL DEFAULT ''"),
+            ("metadata_enriched", "INTEGER NOT NULL DEFAULT 0"),
+            ("ai_rejected", "INTEGER NOT NULL DEFAULT 0"),
         ]
         for col, ddl in migrations:
             if col not in existing_cols:
                 self.conn.execute(f"ALTER TABLE repos ADD COLUMN {col} {ddl}")
+        self.conn.execute(
+            "UPDATE repos SET metadata_enriched = 1 WHERE metadata_enriched = 0 AND created_at != ''"
+        )
+        self.conn.execute(
+            "UPDATE repos SET ai_rejected = 1 WHERE kept = 0 AND ai_rejected = 0 AND ai_highlight = 'AI 判定为低质或套壳噪音仓库'"
+        )
         self.conn.commit()
 
     def count_repos(self) -> int:
@@ -119,16 +131,48 @@ class RadarStore:
 
     def get_existing_meta(self) -> Dict[str, Dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT canonical_key, release_tag, kept, ai_highlight FROM repos"
+            "SELECT canonical_key, release_tag, kept, ai_highlight, ai_rejected FROM repos"
         ).fetchall()
         return {
             str(r["canonical_key"]): {
                 "release_tag": str(r["release_tag"] or ""),
                 "kept": bool(r["kept"]),
                 "ai_highlight": str(r["ai_highlight"] or ""),
+                "ai_rejected": bool(r["ai_rejected"]),
             }
             for r in rows
         }
+
+    def get_negative_cache_items(self) -> Dict[str, Tuple[RepoItem, str, bool]]:
+        """Load kept=0 rows so previously identified noisy repos avoid redundant API enrichment."""
+        rows = self.conn.execute("SELECT * FROM repos WHERE kept = 0").fetchall()
+        return {
+            str(r["canonical_key"]): (
+                self._row_to_item(r),
+                str(r["last_seen_date"] or ""),
+                bool(r["ai_rejected"]),
+            )
+            for r in rows
+        }
+
+    def backfill_missing_categories(self) -> int:
+        """Populate deterministic Chinese category_tag for any kept=1 rows lacking one."""
+        rows = self.conn.execute(
+            "SELECT * FROM repos WHERE kept = 1 AND (category_tag = '' OR category_tag IS NULL)"
+        ).fetchall()
+        updated = 0
+        for r in rows:
+            item = self._row_to_item(r)
+            tag = classify_repo_category(item)
+            if tag:
+                self.conn.execute(
+                    "UPDATE repos SET category_tag = ? WHERE canonical_key = ?",
+                    (tag, str(r["canonical_key"])),
+                )
+                updated += 1
+        if updated:
+            self.conn.commit()
+        return updated
 
     def compute_deltas(
         self, canonical_key: str, snap_date: str, current_stars: int
@@ -228,6 +272,7 @@ class RadarStore:
             license_name=str(r["license_name"] or ""),
             release_tag=str(r["release_tag"] or ""),
             community_score=int(r["community_score"] or 0),
+            metadata_enriched=bool(r["metadata_enriched"] or r["created_at"]),
         )
 
     def reapply_filters(
@@ -242,7 +287,7 @@ class RadarStore:
         if whitelist:
             placeholders = ",".join("?" for _ in whitelist)
             self.conn.execute(
-                f"UPDATE repos SET kept = 1 WHERE kept = 0 AND canonical_key IN ({placeholders})",
+                f"UPDATE repos SET kept = 1, ai_rejected = 0 WHERE kept = 0 AND canonical_key IN ({placeholders})",
                 tuple(whitelist),
             )
             self.conn.commit()
@@ -269,6 +314,7 @@ class RadarStore:
         kept: bool,
         seen_date: str = "",
         force_refresh_discovered: bool = False,
+        ai_rejected: bool = False,
     ) -> None:
         key = item.canonical_key
         safe_url = sanitize_http_url(item.url) or f"https://github.com/{item.repo_name}"
@@ -279,6 +325,7 @@ class RadarStore:
 
         if existing is None:
             eff_seen = seen_date or (item.discovered_at[:10] if item.discovered_at else "")
+            is_enriched = 1 if (item.metadata_enriched or item.created_at) else 0
             self.conn.execute(
                 """
                 INSERT INTO repos (
@@ -286,8 +333,8 @@ class RadarStore:
                     open_issues, created_at, pushed_at, sources_json, discussion_url,
                     desc_cn, ai_highlight, category_tag,
                     stars_delta_24h, stars_delta_7d, topics_json, license_name, release_tag,
-                    community_score, last_seen_date, kept, discovered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    community_score, last_seen_date, metadata_enriched, ai_rejected, kept, discovered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     key,
@@ -312,6 +359,8 @@ class RadarStore:
                     item.release_tag,
                     int(item.community_score),
                     eff_seen,
+                    is_enriched,
+                    1 if ai_rejected else 0,
                     1 if kept else 0,
                     item.discovered_at,
                 ),
@@ -375,6 +424,17 @@ class RadarStore:
         new_kept = (1 if kept else 0) if not kept else int(existing["kept"])
         if force_refresh_discovered and kept:
             new_kept = 1
+        new_enriched = (
+            1
+            if (item.metadata_enriched or item.created_at or int(existing["metadata_enriched"] or 0))
+            else 0
+        )
+        if ai_rejected:
+            new_ai_rejected = 1
+        elif new_kept == 1:
+            new_ai_rejected = 0
+        else:
+            new_ai_rejected = int(existing["ai_rejected"] or 0)
 
         self.conn.execute(
             """
@@ -400,6 +460,8 @@ class RadarStore:
                 release_tag = CASE WHEN ? != '' THEN ? ELSE release_tag END,
                 community_score = MAX(community_score, ?),
                 last_seen_date = ?,
+                metadata_enriched = ?,
+                ai_rejected = ?,
                 kept = ?,
                 discovered_at = ?
             WHERE canonical_key = ?
@@ -432,6 +494,8 @@ class RadarStore:
                 item.release_tag,
                 int(item.community_score),
                 eff_seen,
+                new_enriched,
+                new_ai_rejected,
                 new_kept,
                 new_discovered,
                 key,
@@ -457,11 +521,12 @@ class RadarStore:
     def apply_ai_backfill(self, canonical_key: str, ai_info: Dict[str, Any]) -> bool:
         """Apply AI highlight/category/spam verdict to an existing DB item. Returns True if dropped."""
         if not ai_info.get("keep", True):
+            rej_hl = str(ai_info.get("highlight") or "AI 判定为低质或套壳噪音仓库")
             self.conn.execute(
-                "UPDATE repos SET kept = 0, category_tag = ?, ai_highlight = ? WHERE canonical_key = ?",
+                "UPDATE repos SET kept = 0, ai_rejected = 1, category_tag = ?, ai_highlight = ? WHERE canonical_key = ?",
                 (
                     str(ai_info.get("category_tag") or ""),
-                    str(ai_info.get("highlight") or ""),
+                    rej_hl,
                     canonical_key,
                 ),
             )
@@ -526,13 +591,19 @@ class RadarStore:
         return out
 
     def export_state_gzip(
-        self, out_path: Path, *, max_repos: int = 1800, snapshot_days: int = 14
+        self,
+        out_path: Path,
+        *,
+        max_repos: int = 1800,
+        snapshot_days: int = 14,
+        now_biz: Optional[datetime] = None,
     ) -> None:
         """Export a compact gzipped JSON state snapshot (public repo metadata only) for Pages cache recovery."""
+        ref_now = now_biz or datetime.now(timezone.utc)
         repo_rows = self.conn.execute(
             "SELECT * FROM repos ORDER BY discovered_at DESC LIMIT ?", (int(max_repos),)
         ).fetchall()
-        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=snapshot_days)).isoformat()
+        cutoff = (ref_now.date() - timedelta(days=snapshot_days)).isoformat()
         snap_rows = self.conn.execute(
             "SELECT canonical_key, snap_date, stars FROM repo_snapshots WHERE snap_date >= ? ORDER BY snap_date ASC",
             (cutoff,),
@@ -540,7 +611,7 @@ class RadarStore:
 
         doc = {
             "schema": 1,
-            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "exported_at": ref_now.isoformat(timespec="seconds"),
             "repos": [dict(r) for r in repo_rows],
             "snapshots": [dict(s) for s in snap_rows],
         }
@@ -584,6 +655,18 @@ class RadarStore:
             rname = str(r.get("repo_name") or "").strip()
             if not key or "/" not in key or not rname:
                 continue
+            is_enriched = 1 if (r.get("metadata_enriched") or r.get("created_at")) else 0
+            is_ai_rej = (
+                1
+                if (
+                    r.get("ai_rejected")
+                    or (
+                        not r.get("kept", 1)
+                        and str(r.get("ai_highlight") or "") == "AI 判定为低质或套壳噪音仓库"
+                    )
+                )
+                else 0
+            )
             cur = self.conn.execute(
                 """
                 INSERT OR IGNORE INTO repos (
@@ -591,8 +674,8 @@ class RadarStore:
                     open_issues, created_at, pushed_at, sources_json, discussion_url,
                     desc_cn, ai_highlight, category_tag,
                     stars_delta_24h, stars_delta_7d, topics_json, license_name, release_tag,
-                    community_score, last_seen_date, kept, discovered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    community_score, last_seen_date, metadata_enriched, ai_rejected, kept, discovered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     key,
@@ -617,6 +700,8 @@ class RadarStore:
                     str(r.get("release_tag") or ""),
                     int(r.get("community_score") or 0),
                     str(r.get("last_seen_date") or ""),
+                    is_enriched,
+                    is_ai_rej,
                     1 if r.get("kept", 1) else 0,
                     str(r.get("discovered_at") or datetime.now(timezone.utc).isoformat(timespec="seconds")),
                 ),
@@ -688,6 +773,10 @@ def _try_auto_restore_remote_state(store: RadarStore, cfg: RadarConfig, *, proxy
         return 0
 
 
+def _is_fallback_trend_summary(text: str) -> bool:
+    return str(text or "").strip().startswith("本期在榜 ")
+
+
 def _apply_quota_by_date_groups(items: List[RepoItem], max_share: float) -> List[RepoItem]:
     if max_share <= 0.0 or max_share >= 1.0 or len(items) < 5:
         return items
@@ -716,6 +805,7 @@ def run_pipeline(
     skip_enrich: bool = False,
     enable_notify: bool = True,
     notify_dry_run: bool = False,
+    now_utc: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     data_dir = base_dir / "data"
     feeds_dir = base_dir / "feeds"
@@ -724,9 +814,13 @@ def run_pipeline(
 
     proxy = resolve_proxy(cfg.network)
     github_token = resolve_github_token(cfg.network)
-    now_utc = datetime.now(timezone.utc)
-    now_iso = now_utc.isoformat(timespec="seconds")
-    snap_date = now_utc.strftime("%Y-%m-%d")
+    eff_now_utc = now_utc or datetime.now(timezone.utc)
+    if eff_now_utc.tzinfo is None:
+        eff_now_utc = eff_now_utc.replace(tzinfo=timezone.utc)
+    biz_tz = resolve_timezone(cfg.output)
+    now_biz = eff_now_utc.astimezone(biz_tz)
+    now_iso = now_biz.isoformat(timespec="seconds")
+    snap_date = now_biz.strftime("%Y-%m-%d")
 
     store = RadarStore(data_dir / "radar.db")
     try:
@@ -734,7 +828,7 @@ def run_pipeline(
             _try_auto_restore_remote_state(store, cfg, proxy=proxy)
 
         # Re-apply updated filters on existing stored rows so tightened rules immediately purge historical noise
-        store.reapply_filters(cfg.filters, now_utc=now_utc)
+        store.reapply_filters(cfg.filters, now_utc=eff_now_utc)
 
         source_health: Dict[str, Dict[str, Any]] = {}
         raw_items = (
@@ -743,12 +837,38 @@ def run_pipeline(
             else collect_all_sources(cfg.sources, cfg.network, health_out=source_health)
         )
 
-        # 1. Merge cross-source duplicates + local zero-cost pre-filter BEFORE spending API quota
+        # 1. Merge cross-source duplicates + local zero-cost pre-filter + negative noise cache BEFORE spending API quota
         existing_meta_before = store.get_existing_meta()
+        neg_cache = store.get_negative_cache_items()
         merged_items = merge_raw_items(raw_items)
-        pre_survivors, pre_dropped = prefilter_merged_items(
-            merged_items, cfg.filters, now_utc=now_utc
+        pre_survivors_raw, pre_dropped = prefilter_merged_items(
+            merged_items, cfg.filters, now_utc=eff_now_utc
         )
+        neg_ttl_cutoff = (now_biz.date() - timedelta(days=7)).isoformat()
+        pre_survivors: List[RepoItem] = []
+        for r in pre_survivors_raw:
+            neg_entry = neg_cache.get(r.canonical_key)
+            if neg_entry is not None:
+                cached_item, cached_seen, cached_ai_rejected = neg_entry
+                is_new_release = bool(r.release_tag and r.release_tag != cached_item.release_tag)
+                if not is_new_release:
+                    if cached_ai_rejected:
+                        pre_dropped += 1
+                        continue
+                    if cached_item.metadata_enriched:
+                        hydrated = merge_raw_items([cached_item, r])[0]
+                        if _needs_enrichment(r) and cached_seen and cached_seen >= neg_ttl_cutoff:
+                            hydrated.metadata_enriched = True
+                            still_drop, _ = is_noisy_repo(
+                                hydrated, cfg.filters, now_utc=eff_now_utc, pre_enrich=False
+                            )
+                            if still_drop:
+                                pre_dropped += 1
+                                continue
+                        hydrated.metadata_enriched = bool(r.metadata_enriched)
+                        r = hydrated
+            pre_survivors.append(r)
+
         survivor_keys = {r.canonical_key for r in pre_survivors}
         for r in merged_items:
             if r.canonical_key not in survivor_keys and existing_meta_before.get(r.canonical_key, {}).get("kept"):
@@ -764,41 +884,56 @@ def run_pipeline(
                 github_token=github_token,
             )
 
-        # 3. Full post-enrichment quality & anti-star-farm filtering
+        # 3. Full post-enrichment quality & anti-star-farm filtering (persisting kept=0 negative cache)
         kept_candidates: List[RepoItem] = []
         post_dropped = 0
         for repo in pre_survivors:
-            drop, _ = is_noisy_repo(repo, cfg.filters, now_utc=now_utc, pre_enrich=False)
+            drop, _ = is_noisy_repo(repo, cfg.filters, now_utc=eff_now_utc, pre_enrich=False)
             if drop:
                 post_dropped += 1
-                if existing_meta_before.get(repo.canonical_key, {}).get("kept"):
-                    store.upsert_repo(repo, kept=False, seen_date=snap_date)
+                if not repo.discovered_at:
+                    repo.discovered_at = now_iso
+                store.upsert_repo(repo, kept=False, seen_date=snap_date)
             else:
                 kept_candidates.append(repo)
 
         kept_candidates.sort(
             key=lambda r: (len(r.sources), r.stars_delta_24h, r.stars), reverse=True
         )
-        filter_stats = {
-            "raw_count": len(raw_items),
-            "unique_count": len(merged_items),
-            "dropped_count": pre_dropped + post_dropped,
-        }
 
         existing_meta = store.get_existing_meta()
         fresh_items: List[RepoItem] = []
         release_refresh_keys: set[str] = set()
+        revived_keys: set[str] = set()
         existing_updates: List[RepoItem] = []
+        active_candidates: List[RepoItem] = []
 
         for r in kept_candidates:
             meta = existing_meta.get(r.canonical_key)
             if meta is None:
                 fresh_items.append(r)
+                active_candidates.append(r)
             elif r.release_tag and r.release_tag != meta["release_tag"]:
                 release_refresh_keys.add(r.canonical_key)
                 fresh_items.append(r)
+                active_candidates.append(r)
+            elif not meta["kept"]:
+                if meta["ai_rejected"]:
+                    post_dropped += 1
+                    continue
+                revived_keys.add(r.canonical_key)
+                fresh_items.append(r)
+                active_candidates.append(r)
             else:
                 existing_updates.append(r)
+                active_candidates.append(r)
+
+        kept_candidates = active_candidates
+        filter_stats = {
+            "raw_count": len(raw_items),
+            "unique_count": len(merged_items),
+            "dropped_count": pre_dropped + post_dropped,
+        }
 
         # 4. Compute star deltas against previous snapshots, record today's snapshot, and decay stale deltas
         for item in kept_candidates:
@@ -835,14 +970,16 @@ def run_pipeline(
         for item in existing_updates:
             store.upsert_repo(item, kept=True, seen_date=snap_date)
 
-        # Preserve same-day LLM trend summary when re-running with 0 fresh items
+        # Preserve same-day LLM trend summary when re-running with 0 fresh items (refreshing fallback summaries)
         prev_trend_summary = ""
         status_file = data_dir / "status.json"
         if status_file.exists():
             try:
                 old_st = json.loads(status_file.read_text(encoding="utf-8"))
-                if old_st.get("last_run_date") == datetime.now().strftime("%Y-%m-%d"):
-                    prev_trend_summary = str(old_st.get("trend_summary") or "").strip()
+                if old_st.get("last_run_date") == snap_date:
+                    cand_summary = str(old_st.get("trend_summary") or "").strip()
+                    if cand_summary and not _is_fallback_trend_summary(cand_summary):
+                        prev_trend_summary = cand_summary
             except Exception:
                 pass
 
@@ -873,39 +1010,58 @@ def run_pipeline(
                 )
 
         kept_new_items: List[RepoItem] = []
-        ai_dropped_count = 0
+        fresh_ai_dropped = 0
         for item in fresh_items:
             ai_info = ai_results.get(item.canonical_key)
-            is_rel_refresh = item.canonical_key in release_refresh_keys
+            force_refresh = (
+                item.canonical_key in release_refresh_keys or item.canonical_key in revived_keys
+            )
             if ai_info:
                 if not ai_info.get("keep", True):
-                    store.upsert_repo(item, kept=False, seen_date=snap_date)
-                    ai_dropped_count += 1
+                    item.ai_highlight = str(
+                        ai_info.get("highlight") or "AI 判定为低质或套壳噪音仓库"
+                    )
+                    item.category_tag = str(ai_info.get("category_tag") or "")
+                    store.upsert_repo(item, kept=False, seen_date=snap_date, ai_rejected=True)
+                    fresh_ai_dropped += 1
                     continue
                 item.ai_highlight = ai_info.get("highlight", "")
                 item.category_tag = ai_info.get("category_tag", "")
+            if not item.category_tag:
+                item.category_tag = classify_repo_category(item)
             store.upsert_repo(
                 item,
                 kept=True,
                 seen_date=snap_date,
-                force_refresh_discovered=is_rel_refresh,
+                force_refresh_discovered=force_refresh,
             )
             kept_new_items.append(item)
 
+        backfill_ai_dropped = 0
         for bf_item in backfill_items:
             ai_info = ai_results.get(bf_item.canonical_key)
             if ai_info:
                 if store.apply_ai_backfill(bf_item.canonical_key, ai_info):
-                    ai_dropped_count += 1
+                    backfill_ai_dropped += 1
+
+        store.backfill_missing_categories()
 
         max_feed = int(cfg.output.get("max_feed_items") or 120)
-        now_local = datetime.now().astimezone()
+        run_kept_count = max(0, len(kept_candidates) - fresh_ai_dropped)
+        run_dropped_count = filter_stats["dropped_count"] + fresh_ai_dropped
         status_payload: Dict[str, Any] = {
-            "last_run_at": now_local.isoformat(timespec="seconds"),
-            "last_run_date": now_local.strftime("%Y-%m-%d"),
+            "timezone": str(
+                os.environ.get("RADAR_TIMEZONE", "").strip()
+                or cfg.output.get("timezone")
+                or "Asia/Shanghai"
+            ),
+            "last_run_at": now_iso,
+            "last_run_date": snap_date,
             "raw_count": filter_stats["raw_count"],
             "unique_count": filter_stats["unique_count"],
-            "dropped_count": filter_stats["dropped_count"] + ai_dropped_count,
+            "run_kept_count": run_kept_count,
+            "dropped_count": run_dropped_count,
+            "backfill_dropped_count": backfill_ai_dropped,
             "new_count": len(kept_new_items),
             "feed_total": 0,
             "max_category_share": float(cfg.output.get("max_category_share") or 0.0),
@@ -919,7 +1075,8 @@ def run_pipeline(
             status_payload,
             max_feed=max_feed,
             base_dir=base_dir,
-            now_utc=now_utc,
+            now_utc=eff_now_utc,
+            biz_tz=biz_tz,
         )
         status_payload["feed_total"] = feed_total
         status_file.write_text(
@@ -954,8 +1111,11 @@ def _write_all_outputs(
     max_feed: int = 120,
     base_dir: Optional[Path] = None,
     now_utc: Optional[datetime] = None,
+    biz_tz: Optional[tzinfo] = None,
 ) -> int:
     now = now_utc or datetime.now(timezone.utc)
+    eff_tz = biz_tz or resolve_timezone(cfg.output)
+    now_biz = now.astimezone(eff_tz)
     max_cat_share = float(cfg.output.get("max_category_share") or 0.0)
     raw_recent = store.load_recent_kept(limit=max_feed)
     recent_kept = _apply_quota_by_date_groups(raw_recent, max_cat_share)
@@ -1040,6 +1200,7 @@ def _write_all_outputs(
         out_path=feeds_dir / "data.json",
         sparklines_map=sparklines_map,
         now_utc=now,
+        biz_tz=eff_tz,
     )
 
     llms_path = feeds_dir / "llms.txt"
@@ -1050,13 +1211,14 @@ def _write_all_outputs(
         status=status_for_web,
         out_path=llms_path,
         now_utc=now,
+        biz_tz=eff_tz,
     )
     if base_dir is not None and (base_dir / "web").is_dir():
         (base_dir / "web" / "llms.txt").write_text(
             llms_path.read_text(encoding="utf-8"), encoding="utf-8"
         )
 
-    store.export_state_gzip(feeds_dir / "state_backup.json.gz")
+    store.export_state_gzip(feeds_dir / "state_backup.json.gz", now_biz=now_biz)
     return len(recent_kept)
 
 
@@ -1065,6 +1227,9 @@ def export_only(cfg: RadarConfig, base_dir: Path) -> Dict[str, Any]:
     data_dir = base_dir / "data"
     feeds_dir = base_dir / "feeds"
     feeds_dir.mkdir(parents=True, exist_ok=True)
+    biz_tz = resolve_timezone(cfg.output)
+    now_utc = datetime.now(timezone.utc)
+    now_biz = now_utc.astimezone(biz_tz)
     status_path = data_dir / "status.json"
     status_payload: Dict[str, Any] = {}
     if status_path.exists():
@@ -1073,20 +1238,42 @@ def export_only(cfg: RadarConfig, base_dir: Path) -> Dict[str, Any]:
         except Exception:
             status_payload = {}
     if not status_payload:
-        now_local = datetime.now().astimezone()
         status_payload = {
-            "last_run_at": now_local.isoformat(timespec="seconds"),
-            "last_run_date": now_local.strftime("%Y-%m-%d"),
+            "timezone": str(cfg.output.get("timezone") or "Asia/Shanghai"),
+            "last_run_at": now_biz.isoformat(timespec="seconds"),
+            "last_run_date": now_biz.strftime("%Y-%m-%d"),
             "new_count": 0,
             "feed_total": 0,
         }
+    else:
+        sh = status_payload.get("source_health")
+        reddit_cfg = cfg.sources.get("reddit_rss") or {}
+        extra_urls = cfg.sources.get("extra_rss_urls") or []
+        if (
+            isinstance(sh, dict)
+            and "reddit_rss" in sh
+            and not reddit_cfg.get("enabled", False)
+            and not extra_urls
+            and not (sh["reddit_rss"] or {}).get("ok", True)
+        ):
+            sh.pop("reddit_rss", None)
+        if _is_fallback_trend_summary(status_payload.get("trend_summary", "")):
+            status_payload["trend_summary"] = ""
 
     store = RadarStore(data_dir / "radar.db")
     try:
-        store.reapply_filters(cfg.filters)
+        store.reapply_filters(cfg.filters, now_utc=now_utc)
+        store.backfill_missing_categories()
         max_feed = int(cfg.output.get("max_feed_items") or 120)
         feed_total = _write_all_outputs(
-            store, cfg, feeds_dir, status_payload, max_feed=max_feed, base_dir=base_dir
+            store,
+            cfg,
+            feeds_dir,
+            status_payload,
+            max_feed=max_feed,
+            base_dir=base_dir,
+            now_utc=now_utc,
+            biz_tz=biz_tz,
         )
         status_payload["feed_total"] = feed_total
         status_path.write_text(

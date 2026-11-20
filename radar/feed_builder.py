@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from email.utils import format_datetime
 import html
 import json
@@ -183,8 +183,10 @@ def write_web_json(
     out_path: Path,
     sparklines_map: Optional[Dict[str, List[int]]] = None,
     now_utc: Optional[datetime] = None,
+    biz_tz: Optional[tzinfo] = None,
 ) -> None:
     now = now_utc or datetime.now(timezone.utc)
+    gen_dt = now.astimezone(biz_tz) if biz_tz is not None else now
     payload_items: List[Dict[str, Any]] = []
     smap = sparklines_map or {}
 
@@ -235,7 +237,7 @@ def write_web_json(
         )
 
     payload = {
-        "generated_at": now.isoformat(timespec="seconds"),
+        "generated_at": gen_dt.isoformat(timespec="seconds"),
         "status": status,
         "total": len(payload_items),
         "items": payload_items,
@@ -482,12 +484,14 @@ def write_llms_txt(
     status: Dict[str, Any],
     out_path: Path,
     now_utc: Optional[datetime] = None,
+    biz_tz: Optional[tzinfo] = None,
 ) -> None:
     """Generate /llms.txt following llmstxt.org conventions for zero-setup AI Agent consumption."""
     now = now_utc or datetime.now(timezone.utc)
+    now_disp = now.astimezone(biz_tz) if biz_tz is not None else now
     site = site_base_url.rstrip("/")
     fbase = feeds_base_url.rstrip("/")
-    run_date = str(status.get("last_run_date") or now.strftime("%Y-%m-%d"))
+    run_date = str(status.get("last_run_date") or now_disp.strftime("%Y-%m-%d"))
     trend_summary = str(status.get("trend_summary") or "").strip()
 
     lines = [

@@ -1,0 +1,35 @@
+name: Bug 反馈 (Bug Report)
+description: 报告采集异常、去噪误判、前端交互故障或 RSS/JSON 产物缺陷
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述
+      description: 请简明描述实际发生了什么，以及你期望的正常表现。
+      placeholder: 例如：开启某个信源后点击顶栏胶囊筛选为空，或某个合法项目被反刷星规则误杀…
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤与相关仓库/日志
+      description: 提供复现命令、URL 参数、相关 GitHub 仓库（owner/repo）或 GitHub Actions 报错日志片段。
+      placeholder: |
+        1. 执行 `python run.py --no-ai`
+        2. 观察日志或打开页面 `...`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: env
+    attributes:
+      label: 运行环境
+      options:
+        - GitHub Actions + GitHub Pages（云端定时部署）
+        - 本地命令行（Windows / macOS / Linux）
+        - Docker Compose（Nginx 静态服务）
+    validations:
+      required: true

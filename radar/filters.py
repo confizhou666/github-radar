@@ -155,11 +155,12 @@ def is_noisy_repo(
             if not _is_curated_unverified_language_exempt(item):
                 return True, "no_programming_language"
 
-    # 3. Minimum stars threshold (deferred during pre_enrich when stars == 0 before API lookup)
+    # 3. Minimum stars threshold (deferred during pre_enrich or un-enriched curated fallback when stars == 0)
     min_stars = int(filters_cfg.get("min_stars") or 0)
     if min_stars > 0 and not (pre_enrich and item.stars == 0):
         if item.stars < min_stars:
-            return True, "below_min_stars"
+            if not (item.stars == 0 and _is_curated_unverified_language_exempt(item)):
+                return True, "below_min_stars"
 
     # 4. Minimum meaningful description (deferred during pre_enrich if empty before API lookup)
     min_desc = int(filters_cfg.get("min_desc_chars") or 0)

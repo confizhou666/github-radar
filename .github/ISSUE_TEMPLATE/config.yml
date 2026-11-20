@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 在线演示站点 (GitHub Pages)
+    url: https://confizhou666.github.io/github-radar/
+    about: 先查看线上实时信号台账、RSS 与 /llms.txt 运行状态
+  - name: 私密报告安全漏洞
+    url: https://github.com/confizhou666/github-radar/security/advisories/new
+    about: 涉及 XSS、注入或敏感凭据问题请走私密通道，切勿公开提交 Issue

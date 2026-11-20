@@ -1,0 +1,20 @@
+name: 功能与信源建议 (Feature / Rule Request)
+description: 提议新增高信噪比采集源、去噪/反刷星规则、通知渠道或界面改进
+title: "[Feat] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: 需求背景与痛点
+      description: 这个改进主要解决什么真实使用场景或信噪比痛点？
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 简述你期望的配置项、信源接口格式、过滤规则或交互表现（请注意保持零后端依赖克制原则）。
+    validations:
+      required: true

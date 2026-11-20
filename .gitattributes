@@ -1,0 +1,33 @@
+# Normalize line endings across Windows / Linux / macOS contributors
+* text=auto eol=lf
+
+*.py text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.xml text eol=lf
+*.opml text eol=lf
+*.conf text eol=lf
+LICENSE text eol=lf
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets and compressed snapshots
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.gz binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary

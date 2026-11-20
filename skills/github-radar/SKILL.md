@@ -23,9 +23,10 @@ If running inside a local checkout of `github-radar`, read `feeds/data.json` or 
 ## Schema of `/feeds/data.json`
 
 - `status.trend_summary`: 2–3 sentence daily macro technical wind-vane
+- `status.run_kept_count` / `status.dropped_count`: single-run kept vs noise-intercepted repository counts (`timezone: Asia/Shanghai`)
 - `status.source_health`: per-source fetch health (`ok`, `count`, `duration_ms`)
 - `items[]`: deduplicated, anti-star-farm filtered repositories:
-  - `repo_name`, `url`, `language`, `category_tag`, `topics`, `license_name`, `release_tag`
+  - `repo_name`, `url`, `language`, `category_tag` (100% populated via LLM or deterministic local classifier: `AI应用` / `模型推理` / `系统底层` / `数据存储` / `安全网络` / `桌面工具` / `创意玩具` / `开发框架` / `效率工具`), `topics`, `license_name`, `release_tag`
   - `ai_highlight`: concise Chinese one-sentence takeaway
   - `desc_cn` / `description`: Chinese & original descriptions
   - `stars`, `forks`, `stars_delta_24h`, `stars_delta_7d`, `sparkline` (7-day star array)

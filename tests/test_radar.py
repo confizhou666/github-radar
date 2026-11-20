@@ -12,9 +12,9 @@ from unittest.mock import patch
 import urllib.error
 import xml.etree.ElementTree as ET
 
-from radar.config import RadarConfig
+from radar.config import RadarConfig, resolve_timezone
 from radar.feed_builder import apply_category_quota, normalize_macro_category, resolve_site_and_feeds_urls
-from radar.filters import compute_breakout_score, deduplicate_and_filter, is_noisy_repo
+from radar.filters import compute_breakout_score, is_noisy_repo
 from radar.models import RepoItem
 from radar.notifier import (
     build_digest_markdown,
@@ -24,6 +24,7 @@ from radar.notifier import (
 )
 from radar.pipeline import RadarStore, export_only, restore_state_from_source, run_pipeline
 from radar.sources import (
+    build_subreddit_rss_url,
     collect_all_sources,
     enrich_github_metadata,
     extract_github_repo_from_url,
@@ -32,7 +33,8 @@ from radar.sources import (
     parse_github_trending_html,
     parse_huggingface_papers_json,
 )
-from radar.translator import GITHUB_MODELS_ENDPOINT, generate_ai_highlights
+from radar.translator import classify_repo_category, generate_ai_highlights
+from run import resolve_runtime_paths
 
 
 class _FakeHTTPResp:
@@ -587,53 +589,31 @@ class TestGitHubRadar(unittest.TestCase):
         self.assertEqual(len(res), 5)
         self.assertEqual(summary_box[0], "Rust 命令行与底层工具持续走热，org/tool-4 表现突出。")
 
-        # GitHub Models auto-detection when RADAR_AI_API_KEY is empty and GITHUB_TOKEN is provided
+        # Retired GitHub Models endpoint must NOT be called even when GITHUB_TOKEN is present without RADAR_AI_API_KEY
         captured_reqs = []
 
-        def fake_gh_models_open(req, timeout=60):
-            captured_reqs.append((req.full_url, dict(req.header_items()), json.loads(req.data.decode("utf-8"))))
-            resp_body = {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "items": [
-                                        {
-                                            "repo_name": "org/tool-0",
-                                            "keep": True,
-                                            "category_tag": "系统底层",
-                                            "highlight": "零密钥 GitHub Models 自动导读成功。",
-                                        }
-                                    ]
-                                },
-                                ensure_ascii=False,
-                            )
-                        }
-                    }
-                ]
-            }
-            return _FakeHTTPResp(json.dumps(resp_body, ensure_ascii=False))
+        def fail_if_called(req, timeout=60):
+            captured_reqs.append(req.full_url)
+            return _FakeHTTPResp("OK\r\n")
 
         with patch.dict(os.environ, {"RADAR_AI_API_KEY": "", "OPENAI_API_KEY": ""}, clear=False):
-            with patch("urllib.request.urlopen", side_effect=fake_gh_models_open):
-                gh_res = generate_ai_highlights(
-                    five_items[:1],
-                    {
-                        "enabled": True,
-                        "provider": "auto",
-                        "openai_model": "gpt-4o-mini",
-                        "use_github_models": True,
-                        "github_models_batch_items": 8,
-                    },
-                    github_token="ghs_actions_token",
-                )
-        self.assertEqual(len(captured_reqs), 1)
-        self.assertEqual(captured_reqs[0][0], GITHUB_MODELS_ENDPOINT)
-        self.assertEqual(captured_reqs[0][2]["model"], "openai/gpt-4o-mini")
-        self.assertEqual(gh_res["org/tool-0"]["category_tag"], "系统底层")
+            with patch("radar.translator.shutil.which", return_value=None):
+                with patch("urllib.request.urlopen", side_effect=fail_if_called):
+                    auto_empty = generate_ai_highlights(
+                        five_items[:1],
+                        {"enabled": True, "provider": "auto", "openai_model": "gpt-4o-mini"},
+                        github_token="ghs_actions_token",
+                    )
+                    legacy_gh = generate_ai_highlights(
+                        five_items[:1],
+                        {"enabled": True, "provider": "github_models"},
+                        github_token="ghs_actions_token",
+                    )
+        self.assertEqual(captured_reqs, [])
+        self.assertEqual(auto_empty, {})
+        self.assertEqual(legacy_gh, {})
 
-        # Pipeline backfill: unhighlighted items from earlier run get highlighted on subsequent run
+        # Pipeline backfill: unhighlighted items get deterministic category_tag immediately, and upgrade highlight on subsequent AI run
         cfg = self._cfg()
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -648,6 +628,7 @@ class TestGitHubRadar(unittest.TestCase):
             )
             data1 = json.loads((base / "feeds" / "data.json").read_text(encoding="utf-8"))
             self.assertEqual(data1["items"][0]["ai_highlight"], "")
+            self.assertTrue(data1["items"][0]["category_tag"])
 
             run_pipeline(
                 cfg,
@@ -1174,6 +1155,624 @@ class TestGitHubRadar(unittest.TestCase):
                 self.assertEqual(len(store_plain.load_recent_kept(limit=5)), 1)
             finally:
                 store_plain.close()
+
+    def test_stage1_classifier_timezone_negcache_and_rsshub_urls(self) -> None:
+        """Stage 1 regressions: deterministic Chinese classifier, Asia/Shanghai cross-day timezone, negative cache API savings, and custom RSSHub domains."""
+        cfg = self._cfg()
+        self.assertFalse((cfg.sources.get("reddit_rss") or {}).get("enabled", True))
+        self.assertEqual(int(cfg.filters.get("min_stars") or 0), 5)
+
+        # 1. Deterministic local classifier covers diverse domains without false-matching substrings like 'email' or 'container'
+        self.assertEqual(
+            classify_repo_category(
+                RepoItem(
+                    repo_name="acme/mcp-bridge",
+                    url="u",
+                    description="Connect Claude Code agents via MCP",
+                    topics=["mcp", "claude-code"],
+                    language="TypeScript",
+                )
+            ),
+            "AI应用",
+        )
+        self.assertEqual(
+            classify_repo_category(
+                RepoItem(
+                    repo_name="lab/fast-gguf",
+                    url="u",
+                    description="4-bit quantization and GGUF inference engine",
+                    sources=["HuggingFace Papers"],
+                    language="C++",
+                )
+            ),
+            "模型推理",
+        )
+        # Word-boundary check: 'email', 'domain', 'raid', 'container' must NOT false-trigger 'ai'
+        non_ai_mail = classify_repo_category(
+            RepoItem(
+                repo_name="ops/container-mail-relay",
+                url="u",
+                description="Fast SMTP email relay for custom domain raid storage",
+                language="Go",
+            )
+        )
+        self.assertNotIn(non_ai_mail, {"AI应用", "模型推理"})
+        self.assertEqual(
+            classify_repo_category(
+                RepoItem(
+                    repo_name="sec/wireguard-mesh",
+                    url="u",
+                    description="Zero-trust WireGuard VPN tunnel and firewall",
+                    language="Go",
+                )
+            ),
+            "安全网络",
+        )
+        self.assertEqual(
+            classify_repo_category(
+                RepoItem(
+                    repo_name="db/parquet-olap",
+                    url="u",
+                    description="Embedded columnar SQLite and Parquet OLAP engine",
+                    language="Rust",
+                )
+            ),
+            "数据存储",
+        )
+        self.assertEqual(
+            classify_repo_category(
+                RepoItem(
+                    repo_name="sys/riscv-hypervisor",
+                    url="u",
+                    description="Bare-metal RISC-V microvm hypervisor and eBPF verifier",
+                    language="C",
+                )
+            ),
+            "系统底层",
+        )
+        self.assertEqual(
+            classify_repo_category(
+                RepoItem(
+                    repo_name="art/retro-synth",
+                    url="u",
+                    description="8-bit pixel-art synthesizer and MIDI sequencer",
+                    language="Rust",
+                )
+            ),
+            "创意玩具",
+        )
+        self.assertEqual(
+            classify_repo_category(
+                RepoItem(
+                    repo_name="mac/menubar-clip",
+                    url="u",
+                    description="Native macOS menu-bar clipboard and screenshot manager",
+                    language="Swift",
+                )
+            ),
+            "桌面工具",
+        )
+        self.assertEqual(
+            classify_repo_category(
+                RepoItem(
+                    repo_name="web/solid-router",
+                    url="u",
+                    description="Type-safe UI component-library and state-management for SolidJS",
+                    language="TypeScript",
+                )
+            ),
+            "开发框架",
+        )
+
+        # 2. Self-hosted RSSHub URL builder supports custom domains without 'rsshub' substring
+        self.assertEqual(
+            build_subreddit_rss_url("https://www.reddit.com", "opensource"),
+            "https://www.reddit.com/r/opensource/hot.rss?limit=20",
+        )
+        self.assertEqual(
+            build_subreddit_rss_url("https://rss.mydomain.com/reddit/subreddit", "SideProject"),
+            "https://rss.mydomain.com/reddit/subreddit/SideProject",
+        )
+        self.assertEqual(
+            build_subreddit_rss_url("https://rss.mydomain.com", "selfhosted"),
+            "https://rss.mydomain.com/reddit/subreddit/selfhosted",
+        )
+        self.assertEqual(
+            build_subreddit_rss_url("https://feeds.example.org/sub/{subreddit}/rss", "opensource"),
+            "https://feeds.example.org/sub/opensource/rss",
+        )
+
+        # 3. Unified Asia/Shanghai business timezone at 19:30 UTC (03:30+08:00 next day) + category backfill on legacy empty rows
+        tz_sh = resolve_timezone({"timezone": "Asia/Shanghai"})
+        utc_1930 = datetime(2026, 11, 19, 19, 30, 0, tzinfo=timezone.utc)
+        self.assertEqual(utc_1930.astimezone(tz_sh).strftime("%Y-%m-%d"), "2026-11-20")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            # Pre-seed a legacy kept=1 row with empty category_tag (simulating online restored state_backup)
+            store = RadarStore(base / "data" / "radar.db")
+            try:
+                legacy_item = RepoItem(
+                    repo_name="legacy/ebpf-tracer",
+                    url="https://github.com/legacy/ebpf-tracer",
+                    description="Linux kernel eBPF syscall profiler",
+                    language="C",
+                    stars=220,
+                    forks=18,
+                    sources=["Show HN"],
+                    discovered_at="2026-11-19T08:00:00+08:00",
+                )
+                store.upsert_repo(legacy_item, kept=True, seen_date="2026-11-19")
+            finally:
+                store.close()
+
+            fresh_cli = RepoItem(
+                repo_name="cli/tmux- dash".replace(" ", ""),
+                url="https://github.com/cli/tmux-dash",
+                description="Fast terminal multiplexer dashboard",
+                language="Go",
+                stars=85,
+                forks=7,
+                sources=["GitHub Trending"],
+            )
+            st = run_pipeline(
+                cfg,
+                base,
+                raw_items_override=[fresh_cli],
+                translate_fn=lambda s: s,
+                enable_ai=False,
+                skip_enrich=True,
+                enable_notify=False,
+                now_utc=utc_1930,
+            )
+            self.assertEqual(st["last_run_date"], "2026-11-20")
+            self.assertTrue(st["last_run_at"].startswith("2026-11-20T03:30:00+08:00"))
+            self.assertEqual(st["run_kept_count"], 1)
+            self.assertEqual(st["dropped_count"], 0)
+
+            web_js = json.loads((base / "feeds" / "data.json").read_text(encoding="utf-8"))
+            by_key = {it["key"]: it for it in web_js["items"]}
+            self.assertEqual(by_key["legacy/ebpf-tracer"]["category_tag"], "系统底层")
+            self.assertEqual(by_key["cli/tmux-dash"]["category_tag"], "效率工具")
+            self.assertTrue(
+                by_key["cli/tmux-dash"]["discovered_at"].startswith("2026-11-20T03:30:00+08:00")
+            )
+
+            # 4. Negative cache: newly enriched 0-star noisy repo is cached with kept=0 so Day-2 skips GraphQL/REST API enrichment
+            neg_base = Path(tmp) / "neg"
+            hn_raw = [
+                RepoItem(
+                    repo_name="hn/zero-star-empty",
+                    url="https://github.com/hn/zero-star-empty",
+                    description="Brand new empty repo posted on HN",
+                    stars=0,
+                    language=None,
+                    sources=["Show HN"],
+                )
+            ]
+            api_calls: list[str] = []
+
+            def fake_collect(_src_cfg, _net_cfg, health_out=None):
+                if health_out is not None:
+                    health_out["hackernews_show"] = {"ok": True, "count": 1, "duration_ms": 50, "error": ""}
+                return [
+                    RepoItem(
+                        repo_name=hn_raw[0].repo_name,
+                        url=hn_raw[0].url,
+                        description=hn_raw[0].description,
+                        stars=0,
+                        language=None,
+                        sources=["Show HN"],
+                    )
+                ]
+
+            def fake_enrich(items_to_enrich, **_kwargs):
+                for it in items_to_enrich:
+                    api_calls.append(it.canonical_key)
+                    it.stars = 1  # Below min_stars=5
+                    it.forks = 0
+                    it.language = "Python"
+                    it.created_at = "2026-11-20T01:00:00Z"
+                    it.metadata_enriched = True
+                return len(items_to_enrich)
+
+            with patch("radar.pipeline.collect_all_sources", side_effect=fake_collect):
+                with patch("radar.pipeline.enrich_github_metadata", side_effect=fake_enrich):
+                    st_day1 = run_pipeline(
+                        cfg,
+                        neg_base,
+                        translate_fn=lambda s: s,
+                        enable_ai=False,
+                        enable_notify=False,
+                        now_utc=utc_1930,
+                    )
+                    self.assertEqual(api_calls, ["hn/zero-star-empty"])
+                    self.assertEqual(st_day1["run_kept_count"], 0)
+                    self.assertEqual(st_day1["dropped_count"], 1)
+
+                    # Day 2: same un-enriched Show HN item hits negative cache BEFORE enrich_github_metadata
+                    api_calls.clear()
+                    st_day2 = run_pipeline(
+                        cfg,
+                        neg_base,
+                        translate_fn=lambda s: s,
+                        enable_ai=False,
+                        enable_notify=False,
+                        now_utc=utc_1930 + timedelta(days=1),
+                    )
+                    self.assertEqual(api_calls, [])
+                    self.assertEqual(st_day2["run_kept_count"], 0)
+                    self.assertEqual(st_day2["dropped_count"], 1)
+
+            # Day 3: repo blows up on GitHub Trending with 160 stars -> revives cleanly to kept=1!
+            surged = RepoItem(
+                repo_name="hn/zero-star-empty",
+                url="https://github.com/hn/zero-star-empty",
+                description="Brand new repo that surged overnight with real community forks",
+                language="Python",
+                stars=160,
+                forks=14,
+                sources=["GitHub Trending"],
+            )
+            st_day3 = run_pipeline(
+                cfg,
+                neg_base,
+                raw_items_override=[surged],
+                translate_fn=lambda s: s,
+                enable_ai=False,
+                skip_enrich=True,
+                enable_notify=False,
+                now_utc=utc_1930 + timedelta(days=2),
+            )
+            self.assertEqual(st_day3["run_kept_count"], 1)
+            self.assertEqual(st_day3["new_count"], 1)
+
+    def test_review_round_zero_star_reapply_ai_rejected_negcache_and_cli_paths(self) -> None:
+        """Regression suite for enriched 0-star purge, ai_rejected vs positive highlight revival, rate-limited neg_cache, fallback trend refresh, and CLI paths."""
+        cfg = self._cfg()
+        now = datetime(2026, 11, 20, 3, 30, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # 1. Enriched 0-star Show HN / HF Papers repos in radar.db MUST be purged by reapply_filters when min_stars=5
+            base_zero = root / "zero_purge"
+            store = RadarStore(base_zero / "data" / "radar.db")
+            try:
+                enriched_zero_hn = RepoItem(
+                    repo_name="hn/enriched-zero-star",
+                    url="https://github.com/hn/enriched-zero-star",
+                    description="Weekend empty scaffold on Show HN",
+                    language="Python",
+                    stars=0,
+                    forks=0,
+                    created_at="2026-11-19T12:30:42Z",
+                    sources=["Show HN"],
+                    metadata_enriched=True,
+                    discovered_at="2026-11-19T20:30:00+08:00",
+                )
+                unverified_zero_hn = RepoItem(
+                    repo_name="hn/unverified-quota-exempt",
+                    url="https://github.com/hn/unverified-quota-exempt",
+                    description="Unenriched community post when API quota ran out",
+                    language=None,
+                    stars=0,
+                    created_at="",
+                    sources=["Show HN"],
+                    metadata_enriched=False,
+                    discovered_at="2026-11-19T20:30:00+08:00",
+                )
+                store.upsert_repo(enriched_zero_hn, kept=True, seen_date="2026-11-19")
+                store.upsert_repo(unverified_zero_hn, kept=True, seen_date="2026-11-19")
+                purged_n = store.reapply_filters(cfg.filters, now_utc=now)
+                self.assertEqual(purged_n, 1)
+                remaining_keys = [x.canonical_key for x in store.load_recent_kept(limit=10)]
+                self.assertEqual(remaining_keys, ["hn/unverified-quota-exempt"])
+            finally:
+                store.close()
+
+            # 2a. Positive ai_highlight repo temporarily dropped by tightened min_stars MUST revive cleanly (not blackholed)
+            base_hl = root / "hl_revive"
+            good_repo = RepoItem(
+                repo_name="org/highlighted-gem",
+                url="https://github.com/org/highlighted-gem",
+                description="High-speed terminal multiplexer in Rust",
+                language="Rust",
+                stars=20,
+                forks=3,
+                created_at="2026-11-15T00:00:00Z",
+                sources=["GitHub Trending"],
+                metadata_enriched=True,
+            )
+            run_pipeline(
+                cfg,
+                base_hl,
+                raw_items_override=[good_repo],
+                translate_fn=lambda s: s,
+                ai_runner=lambda _p: json.dumps(
+                    {
+                        "items": [
+                            {
+                                "repo_name": "org/highlighted-gem",
+                                "keep": True,
+                                "category_tag": "效率工具",
+                                "highlight": "单二进制极速终端分屏器，启动耗时低于 3ms。",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                enable_ai=True,
+                skip_enrich=True,
+                enable_notify=False,
+                now_utc=now,
+            )
+            tight_cfg = self._cfg()
+            tight_cfg.filters = {**tight_cfg.filters, "min_stars": 100}
+            export_only(tight_cfg, base_hl)
+            d_tight = json.loads((base_hl / "feeds" / "data.json").read_text(encoding="utf-8"))
+            self.assertEqual(d_tight["total"], 0)
+
+            # Repo surges to 260 stars -> revives with its original positive ai_highlight intact!
+            surged_good = RepoItem(
+                repo_name="org/highlighted-gem",
+                url="https://github.com/org/highlighted-gem",
+                description="High-speed terminal multiplexer in Rust",
+                language="Rust",
+                stars=260,
+                forks=22,
+                sources=["GitHub Trending"],
+            )
+            st_revived = run_pipeline(
+                tight_cfg,
+                base_hl,
+                raw_items_override=[surged_good],
+                translate_fn=lambda s: s,
+                enable_ai=False,
+                skip_enrich=True,
+                enable_notify=False,
+                now_utc=now + timedelta(days=1),
+            )
+            self.assertEqual(st_revived["run_kept_count"], 1)
+            d_revived = json.loads((base_hl / "feeds" / "data.json").read_text(encoding="utf-8"))
+            self.assertEqual(d_revived["total"], 1)
+            self.assertIn("单二进制极速终端分屏器", d_revived["items"][0]["ai_highlight"])
+
+            # 2b. Backfill AI rejection (keep=False with empty highlight="") MUST set ai_rejected=1 and stay blocked
+            base_bf = root / "bf_spam"
+            disguised_spam = RepoItem(
+                repo_name="spam/disguised-wrapper",
+                url="https://github.com/spam/disguised-wrapper",
+                description="A seemingly normal Python tool",
+                language="Python",
+                stars=80,
+                forks=10,
+                created_at="2026-11-18T00:00:00Z",
+                sources=["GitHub Trending"],
+                metadata_enriched=True,
+            )
+            run_pipeline(
+                cfg,
+                base_bf,
+                raw_items_override=[disguised_spam],
+                translate_fn=lambda s: s,
+                enable_ai=False,
+                skip_enrich=True,
+                enable_notify=False,
+                now_utc=now,
+            )
+
+            def reject_backfill_runner(_prompt: str) -> str:
+                return json.dumps(
+                    {
+                        "items": [
+                            {
+                                "repo_name": "spam/disguised-wrapper",
+                                "keep": False,
+                                "category_tag": "效率工具",
+                                "highlight": "",
+                            }
+                        ]
+                    }
+                )
+
+            run_pipeline(
+                cfg,
+                base_bf,
+                raw_items_override=[],
+                translate_fn=lambda s: s,
+                ai_runner=reject_backfill_runner,
+                enable_ai=True,
+                skip_enrich=True,
+                enable_notify=False,
+                now_utc=now + timedelta(hours=1),
+            )
+            # Next day spam reappears on Trending -> must remain blocked by ai_rejected=1
+            st_spam_next = run_pipeline(
+                cfg,
+                base_bf,
+                raw_items_override=[disguised_spam],
+                translate_fn=lambda s: s,
+                enable_ai=False,
+                skip_enrich=True,
+                enable_notify=False,
+                now_utc=now + timedelta(days=1),
+            )
+            self.assertEqual(st_spam_next["run_kept_count"], 0)
+            self.assertEqual(st_spam_next["dropped_count"], 1)
+
+            # 3. Rate-limited un-enriched Trending item on Day 1 MUST NOT poison Day-2 enrichment in neg_cache,
+            #    and relaxing min_stars from 5 -> 1 carries forward cached enriched metadata!
+            base_rl = root / "rate_limit_neg"
+            un_enriched_trending = RepoItem(
+                repo_name="sys/no-html-lang-zig",
+                url="https://github.com/sys/no-html-lang-zig",
+                description="Lock-free ring buffer",
+                language=None,
+                stars=90,
+                forks=8,
+                sources=["GitHub Trending"],
+                metadata_enriched=False,
+            )
+
+            def collect_trending(_s, _n, health_out=None):
+                return [
+                    RepoItem(
+                        repo_name=un_enriched_trending.repo_name,
+                        url=un_enriched_trending.url,
+                        description=un_enriched_trending.description,
+                        language=None,
+                        stars=90,
+                        forks=8,
+                        sources=["GitHub Trending"],
+                        metadata_enriched=False,
+                    )
+                ]
+
+            enrich_attempts: list[str] = []
+
+            def rate_limited_day1(items_list, **_kw):
+                enrich_attempts.extend(x.canonical_key for x in items_list)
+                return 0  # Simulated 429 rate-limit before enrichment succeeded
+
+            def healthy_day2(items_list, **_kw):
+                for x in items_list:
+                    enrich_attempts.append(x.canonical_key)
+                    x.language = "Zig"
+                    x.created_at = "2026-11-18T00:00:00Z"
+                    x.metadata_enriched = True
+                return len(items_list)
+
+            with patch("radar.pipeline.collect_all_sources", side_effect=collect_trending):
+                with patch("radar.pipeline.enrich_github_metadata", side_effect=rate_limited_day1):
+                    st_rl1 = run_pipeline(
+                        cfg, base_rl, translate_fn=lambda s: s, enable_ai=False, enable_notify=False, now_utc=now
+                    )
+                    self.assertEqual(st_rl1["run_kept_count"], 0)
+                enrich_attempts.clear()
+                with patch("radar.pipeline.enrich_github_metadata", side_effect=healthy_day2):
+                    st_rl2 = run_pipeline(
+                        cfg,
+                        base_rl,
+                        translate_fn=lambda s: s,
+                        enable_ai=False,
+                        enable_notify=False,
+                        now_utc=now + timedelta(days=1),
+                    )
+                    self.assertEqual(enrich_attempts, ["sys/no-html-lang-zig"])
+                    self.assertEqual(st_rl2["run_kept_count"], 1)
+
+            # Relaxing min_stars from 5 -> 1 hydrates cached 2-star Show HN repo even when skip_enrich=True
+            base_relax = root / "relax_min_stars"
+            raw_hn_unverified = RepoItem(
+                repo_name="hn/two-star-rust-cli",
+                url="https://github.com/hn/two-star-rust-cli",
+                description="Tiny Rust binary hex viewer",
+                language=None,
+                stars=0,
+                sources=["Show HN"],
+                metadata_enriched=False,
+            )
+
+            def collect_hn_two_star(_s, _n, health_out=None):
+                return [
+                    RepoItem(
+                        repo_name=raw_hn_unverified.repo_name,
+                        url=raw_hn_unverified.url,
+                        description=raw_hn_unverified.description,
+                        language=None,
+                        stars=0,
+                        sources=["Show HN"],
+                    )
+                ]
+
+            def enrich_to_two_stars(items_list, **_kw):
+                for x in items_list:
+                    x.stars = 2
+                    x.forks = 1
+                    x.language = "Rust"
+                    x.created_at = "2026-11-19T10:00:00Z"
+                    x.metadata_enriched = True
+                return len(items_list)
+
+            with patch("radar.pipeline.collect_all_sources", side_effect=collect_hn_two_star):
+                with patch("radar.pipeline.enrich_github_metadata", side_effect=enrich_to_two_stars):
+                    st_drop_d1 = run_pipeline(
+                        cfg,
+                        base_relax,
+                        translate_fn=lambda s: s,
+                        enable_ai=False,
+                        enable_notify=False,
+                        now_utc=now,
+                    )
+                    self.assertEqual(st_drop_d1["run_kept_count"], 0)
+
+            relaxed_cfg = self._cfg()
+            relaxed_cfg.filters = {**relaxed_cfg.filters, "min_stars": 1}
+            st_relaxed = run_pipeline(
+                relaxed_cfg,
+                base_relax,
+                raw_items_override=[raw_hn_unverified],
+                translate_fn=lambda s: s,
+                enable_ai=False,
+                skip_enrich=True,
+                enable_notify=False,
+                now_utc=now + timedelta(days=1),
+            )
+            self.assertEqual(st_relaxed["run_kept_count"], 1)
+            d_relaxed = json.loads((base_relax / "feeds" / "data.json").read_text(encoding="utf-8"))
+            self.assertEqual(d_relaxed["items"][0]["stars"], 2)
+            self.assertEqual(d_relaxed["items"][0]["language"], "Rust")
+
+            # 4. Stale fallback trend_summary refreshes on export_only after purging <5★ and backfilling categories
+            base_ts = root / "trend_refresh"
+            store_ts = RadarStore(base_ts / "data" / "radar.db")
+            try:
+                store_ts.upsert_repo(
+                    RepoItem(
+                        repo_name="sys/ebpf-top",
+                        url="https://github.com/sys/ebpf-top",
+                        description="Real-time eBPF kernel monitor",
+                        language="C",
+                        stars=150,
+                        forks=12,
+                        created_at="2026-11-18T00:00:00Z",
+                        sources=["Show HN"],
+                        metadata_enriched=True,
+                        discovered_at="2026-11-20T03:30:00+08:00",
+                    ),
+                    kept=True,
+                    seen_date="2026-11-20",
+                )
+            finally:
+                store_ts.close()
+            (base_ts / "data" / "status.json").write_text(
+                json.dumps(
+                    {
+                        "last_run_at": "2026-11-20T01:22:31+00:00",
+                        "last_run_date": "2026-11-20",
+                        "trend_summary": "本期在榜 116 个项目，主力语言集中在 Python（42）。",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            st_exp = export_only(cfg, base_ts)
+            self.assertIn("本期在榜 1 个项目", st_exp["trend_summary"])
+            self.assertIn("系统底层", st_exp["trend_summary"])
+
+            # 5. Packaged CLI resolve_runtime_paths resolves CWD config before site-packages script_dir
+            fake_site_packages = root / "site_packages"
+            fake_site_packages.mkdir()
+            user_workspace = root / "user_workspace"
+            user_workspace.mkdir()
+            user_cfg = user_workspace / "config.yaml"
+            user_cfg.write_text("filters:\n  min_stars: 5\n", encoding="utf-8")
+            resolved_base, resolved_cfg = resolve_runtime_paths(
+                "config.yaml", cwd=user_workspace, script_dir=fake_site_packages
+            )
+            self.assertEqual(resolved_base, user_workspace.resolve())
+            self.assertEqual(resolved_cfg, user_cfg.resolve())
 
 
 if __name__ == "__main__":

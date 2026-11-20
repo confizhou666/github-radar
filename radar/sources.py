@@ -618,6 +618,23 @@ def _parse_rss_or_atom(xml_text: str, source_label: str) -> List[RepoItem]:
     return out
 
 
+def build_subreddit_rss_url(base_url: str, subreddit: str) -> str:
+    """Build subreddit feed URL compatible with official Reddit, custom-domain RSSHub, or URL templates."""
+    base = (base_url or "https://www.reddit.com").strip().rstrip("/")
+    sub_q = urllib.parse.quote((subreddit or "").strip().strip("/"))
+    if "{subreddit}" in base:
+        return base.replace("{subreddit}", sub_q)
+
+    parsed = urllib.parse.urlsplit(base)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").rstrip("/")
+    if host == "reddit.com" or host.endswith(".reddit.com") or host == "redd.it":
+        return f"{base}/r/{sub_q}/hot.rss?limit=20"
+    if path:
+        return f"{base}/{sub_q}"
+    return f"{base}/reddit/subreddit/{sub_q}"
+
+
 def fetch_reddit_and_extra_rss(
     reddit_cfg: Dict[str, Any],
     extra_urls: List[str],
@@ -626,16 +643,13 @@ def fetch_reddit_and_extra_rss(
     errors_out: Optional[List[str]] = None,
 ) -> List[RepoItem]:
     out: List[RepoItem] = []
-    if reddit_cfg.get("enabled", True):
+    if reddit_cfg.get("enabled", False):
         base_url = str(reddit_cfg.get("rss_base_url") or "https://www.reddit.com").rstrip("/")
         for sub in reddit_cfg.get("subreddits") or []:
             s = str(sub).strip()
             if not s:
                 continue
-            if "rsshub" in base_url:
-                url = f"{base_url.rstrip('/')}/{urllib.parse.quote(s)}"
-            else:
-                url = f"{base_url}/r/{urllib.parse.quote(s)}/hot.rss?limit=20"
+            url = build_subreddit_rss_url(base_url, s)
             try:
                 _, xml_text, _ = _http_get(
                     url,
@@ -965,7 +979,7 @@ def collect_all_sources(
 
     reddit_cfg = sources_cfg.get("reddit_rss") or {}
     extra_urls = sources_cfg.get("extra_rss_urls") or []
-    if reddit_cfg.get("enabled", True) or extra_urls:
+    if reddit_cfg.get("enabled", False) or extra_urls:
         tasks.append(
             (
                 "reddit_rss",

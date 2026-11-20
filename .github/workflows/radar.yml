@@ -4,17 +4,29 @@ on:
   schedule:
     # 每天北京时间 03:30 (UTC 19:30) 自动执行
     - cron: "30 19 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - "web/**"
+      - "radar/**"
+      - "config.yaml"
+      - "run.py"
+      - ".github/workflows/radar.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
   pages: write
   id-token: write
-  models: read
 
 concurrency:
   group: "pages"
   cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  PYTHONUTF8: "1"
 
 jobs:
   build-and-deploy:
@@ -24,23 +36,24 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Pages
         id: pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
         continue-on-error: true
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
       - name: Restore SQLite database cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: data
           key: radar-db-${{ github.run_id }}
@@ -49,6 +62,7 @@ jobs:
 
       - name: Run GitHub Radar pipeline
         env:
+          RADAR_TIMEZONE: Asia/Shanghai
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RADAR_PUBLIC_BASE_URL: ${{ steps.pages.outputs.base_url }}
           RADAR_AI_API_KEY: ${{ secrets.RADAR_AI_API_KEY }}
@@ -57,7 +71,12 @@ jobs:
           RADAR_WEBHOOK_URL: ${{ secrets.RADAR_WEBHOOK_URL }}
           RADAR_TG_BOT_TOKEN: ${{ secrets.RADAR_TG_BOT_TOKEN }}
           RADAR_TG_CHAT_ID: ${{ secrets.RADAR_TG_CHAT_ID }}
-        run: python run.py
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            python run.py --no-notify
+          else
+            python run.py
+          fi
 
       - name: Assemble static site for GitHub Pages
         run: |
@@ -68,10 +87,10 @@ jobs:
           cp -f feeds/feeds.opml _site/feeds.opml
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

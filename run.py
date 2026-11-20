@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 import subprocess
+from typing import Optional, Tuple
 
 from radar.config import RadarConfig
 from radar.pipeline import RadarStore, export_only, restore_state_from_source, run_pipeline
@@ -44,6 +45,27 @@ def refresh_freshrss(user: str = "admin") -> None:
         logger.debug("跳过 FreshRSS 立即刷新: %s", exc)
 
 
+def resolve_runtime_paths(
+    config_arg: str,
+    *,
+    cwd: Optional[Path] = None,
+    script_dir: Optional[Path] = None,
+) -> Tuple[Path, Path]:
+    """Resolve (base_dir, config_path) safely for both repo-script and installed CLI wheel usage."""
+    eff_cwd = (cwd or Path.cwd()).resolve()
+    eff_script = (script_dir or Path(__file__).resolve().parent).resolve()
+    raw_cfg = Path(config_arg)
+    if raw_cfg.is_absolute():
+        cfg_path = raw_cfg.resolve()
+        return cfg_path.parent, cfg_path
+    if (eff_cwd / raw_cfg).is_file():
+        return eff_cwd, (eff_cwd / raw_cfg).resolve()
+    if (eff_script / raw_cfg).is_file():
+        return eff_script, (eff_script / raw_cfg).resolve()
+    fallback_cfg = eff_cwd / raw_cfg
+    return fallback_cfg.parent, fallback_cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GitHub Discovery & Translation Radar")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
@@ -67,8 +89,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    base_dir = Path(__file__).resolve().parent
-    cfg = RadarConfig.load(base_dir / args.config)
+    base_dir, cfg_path = resolve_runtime_paths(args.config)
+    cfg = RadarConfig.load(cfg_path)
 
     if args.restore_state:
         store = RadarStore(base_dir / "data" / "radar.db")
